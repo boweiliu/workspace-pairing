@@ -1767,3 +1767,16 @@ parent_type = "claude"
 
 [agent_types.worker]
 parent_type = "claude"
+
+# bowei_cloud create template (mirrors vultr/docker/imbue_cloud): stacks on
+# `main` to contribute the Dockerfile build + seed + idle_mode that `main`
+# alone lacks. Without this, --template main produces a bare debian container
+# (no uv/supervisord) -> forward "no backend" -> UI stuck on "loading workspace".
+[create_templates.bowei_cloud]
+provider = "bowei_cloud"
+target_path = "/home/user/workspace/"
+build_arg__extend = ["--file=system/Dockerfile", "."]
+idle_mode = "disabled"
+start_arg__extend = ["--security-opt=no-new-privileges", "--workdir=/", "--restart=unless-stopped"]
+post_host_create_command__extend = ["/usr/local/bin/default-workspace-template-seed"]
+pass_host_env__extend = ["MNGR_PREFIX"]

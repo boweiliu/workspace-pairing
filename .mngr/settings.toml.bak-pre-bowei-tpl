@@ -1,0 +1,1769 @@
+# Readiness budget for every harness's create wait (mngr default is 10.0s,
+# which pre-dates the chat UI gating creation on readiness). Covers the
+# measured cold boots -- claude ~4s, codex ~6s, and pi's WORST case: a
+# brand-new pi agent whose extension TypeScript is transpiled from scratch by
+# jiti (its cache is path-keyed, so a fresh per-agent npm path is a cache miss)
+# costs ~28-32s cold before its readiness sentinel. 20s cut that off and failed
+# the create (empty model bar / rolled-back agent); 45s clears the cold path
+# with headroom on a loaded host. See [agent_types.pi-coding].share_home_npm_dir
+# for the real fix (share the cache so new agents start warm at ~10s). A create
+# that misses this budget fails loudly and is rolled back.
+agent_ready_timeout = 45.0
+
+# Command defaults
+
+# Default create command settings -- apply to all mngr create from this repo.
+#
+# No default `type` here, on purpose. The agent type a create resolves to when it
+# names none -- and the provider account it runs on -- come from the git-ignored
+# `.mngr/settings.local.toml`, which the chat app writes from the account store
+# (system/apps/chat/imbue/chat/create_defaults.py): the pinned default account,
+# else the most recently used one, as `type` plus its binding (`env__extend` for
+# claude, an `extra_provision_command__extend` credential link for the others)
+# plus an `account=<id>` label. That file is the one place a workspace's default
+# harness lives, so a create with no account fails rather than launching a claude
+# that cannot take a turn; see [pre_command_scripts] below for the message it fails
+# with. Every creator that wants a specific harness says so with `--type`.
+[commands.create]
+connect = false
+ensure_clean = false
+pass_env__extend = ["REMOTE_SERVICE_CONNECTOR_URL", "LATCHKEY_GATEWAY"]
+host_env__extend = [
+    "IS_SANDBOX=1",
+    "IS_AUTONOMOUS=1",
+    # Skip Claude Code's org-level fast-mode eligibility check. Agents sign in
+    # with a Claude Max subscription that supports fast mode, but the session
+    # resolves under an organization whose org check otherwise reports fast
+    # mode as "currently unavailable" -- so without this, /fast is refused in
+    # the container even though the same account gets fast mode on the laptop.
+    "CLAUDE_CODE_SKIP_FAST_MODE_ORG_CHECK=1",
+    # Lock Claude Code to the version pinned in agent_types.claude.version and
+    # setup_system.sh's CLAUDE_CODE_VERSION; disable the auto-updater + background
+    # feedback pings so the installed binary cannot silently drift. Tracks the
+    # FIXME on ClaudeAgentConfig.version in libs/mngr_claude/.../plugin.py.
+    "DISABLE_AUTOUPDATER=1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1",
+    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1",
+    # Disable claude.ai account MCP connector sync -- it's an OAuth side
+    # channel to third-party services that bypasses the latchkey gateway for
+    # the services latchkey DOES support. MCP itself is not disallowed: for a
+    # service latchkey has no builtin for, the connect-external-service skill
+    # connects that service's MCP server through mcpc, the workspace's shared
+    # MCP client, rather than through any one harness.
+    "ENABLE_CLAUDEAI_MCP_SERVERS=false",
+    # Tickets live inside runtime/ so they are covered by the opt-in GitHub
+    # sync (github-sync skill) when the user enables it.
+    # tk reads TICKETS_DIR if set; absolute path so it works from worktree
+    # subdirs too. /home/user/workspace/ is the container WORKDIR (set by the Dockerfile).
+    "TICKETS_DIR=/home/user/workspace/data/.tickets",
+    # The OOM shed ledger + agent-pid registry live under runtime/ (so they ride
+    # the runtime-backup branch). The container-level earlyoom kill hook runs
+    # with work dir /home/user/workspace, but each agent's SessionStart hooks resolve paths
+    # relative to THEIR agent's MNGR_AGENT_WORK_DIR -- which for a worker is its
+    # own worktree, not /home/user/workspace. Pinning the absolute path here (same
+    # rationale as TICKETS_DIR above) makes the kill hook and every agent's hook
+    # resolve one shared ledger and registry, regardless of work dir.
+    "OOM_PRIORITY_RUNTIME_DIR=/home/user/workspace/data/.state/oom_priority",
+    # Keep regenerable caches off the persistent /home/user volume (and out of
+    # backups): XDG-aware tools (uv, pip, playwright) follow XDG_CACHE_HOME,
+    # npm follows npm_config_cache, and the seed script's ~/.cache symlink
+    # catches stragglers that hardcode ~/.cache.
+    "XDG_CACHE_HOME=/var/cache/user",
+    "npm_config_cache=/var/cache/user/npm",
+    # Workaround for an Apple M5 lima-VZ guest CPU mismatch: the Debian 12
+    # guest kernel advertises SVE / SVE2 in /proc/cpuinfo, but lima-VZ on M5
+    # traps the `cntb` SVE instruction emitted by OpenSSL's
+    # `_armv8_sve_get_vl_bytes` during CPU-cap init -- so cryptography>=47's
+    # Rust openssl binding SIGILLs on import (rc=132), taking down any tool
+    # that transitively imports paramiko (mngr CLI, system-interface, etc.).
+    # OPENSSL_armcap=0 disables OpenSSL's CPU-cap detection so it falls back
+    # to NEON-only paths; runs cleanly on both real M-series silicon and
+    # lima-VZ. Performance impact is negligible for this workload (TLS / SSH
+    # session setup only). Drop when lima-VZ on M5 correctly virtualizes SVE
+    # or when upstream OpenSSL guards `cntb` behind hwcap2. Empirically
+    # bisected to `_armv8_sve_get_vl_bytes+0: cntb x0` via gdb on a fresh
+    # Debian 12 lima VM on the launch-to-msg M5 runner; Ubuntu 24.04 lima
+    # guests don't advertise SVE so they don't hit this.
+    "OPENSSL_armcap=0",
+]
+worktree_base_folder = "/home/user/worktrees/"
+# claude_subagent_proxy is upstream mngr's experimental Claude-Code-Task ->
+# mngr-managed-subagent proxy. It is not used here. Without this disable, when
+# the proxy plugin is present in the system-tool mngr install it gets the
+# on_after_provisioning hook fired, which installs a PreToolUse:Agent hook
+# (spawn.py) into each new agent's .claude/settings.local.json -- and that
+# hook then wedges parent agents in a Haiku retry loop whenever it hits a
+# permanent error (e.g. the proxy package isn't in /home/user/workspace/.venv, or
+# `mngr-proxy-child` isn't a registered agent type in the resolved mngr).
+# The disable is non-strict (commands.create.disable_plugin path), so this is
+# safe even on installs that don't include the proxy plugin at all.
+disable_plugin__extend = ["recursive", "ttyd", "claude_subagent_proxy"]
+yes = true
+
+# Runs before every `mngr create` from this project root. Inside the workspace,
+# with no provider account signed in, there is no settings.local.toml naming a
+# default type, and mngr's own refusal ("No agent type provided", with a hint to
+# set one in config) sends the user after the wrong fix; the script refuses with
+# "sign in first" instead. It gates on the create's project root being the work
+# dir of the agent running it, so the create of the workspace itself -- run on the
+# user's machine from a clone of this template that is nobody's work dir -- is
+# never refused. The shell test in front spares a plain user shell the python3
+# (macOS's stub would prompt to install the Command Line Tools), but not an mngr
+# agent on that machine, which has MNGR_AGENT_ID like any other; see the script's
+# docstring for what that means when working on this repo from a Mac.
+[pre_command_scripts]
+create = ["[ -z \"$MNGR_AGENT_ID\" ] || python3 system/scripts/require_create_account.py"]
+
+# A worker's worktree carries no settings.local.toml of its own (the file is
+# git-ignored), so a create run from inside one -- a worker launching a worker --
+# would name no type and no account. Sharing the workspace's copy by symlink keeps
+# every checkout of the workspace on the same default account.
+[work_dir_extra_paths]
+".mngr/settings.local.toml" = "SHARE"
+
+# Agent types
+
+# Agent type defaults -- apply to all claude agents created from this repo
+[agent_types.claude]
+auto_dismiss_dialogs_at_startup = true
+# Dialogs mngr may answer on the user's behalf when one is holding the TUI's input at send
+# time. Anything not listed here that needs a real answer refuses the send with an error
+# naming what is in the way, rather than mngr guessing; anything Esc closes harmlessly is
+# dismissed regardless of this list.
+#
+# Answer every dialog mngr knows a sensible answer for, and fall back to pressing "1" on one
+# it cannot name. A named dialog is answered by cycling the selector onto its own chosen option
+# -- never by pressing Enter on whatever happens to be highlighted -- so that half grants no
+# power to guess. The alternative, an explicit list, silently stops covering each dialog added
+# upstream: the model and effort switch confirmations were listed here, so a usage-limit or
+# LSP-install prompt blocked sends until someone noticed and added it.
+#
+# The "and unknown" half IS a guess, chosen deliberately: a workspace chat has no good way to
+# show a dialog nobody has named, so refusing there strands the message until someone opens
+# the terminal tab. It is bounded -- the digit only goes to a pane actually showing a numbered
+# selector, and if the surface does not clear, the send still refuses rather than pressing on.
+# Narrow it to ALL_KNOWN_DIALOGS to go back to refusing anything unnamed.
+sensibly_deal_with_dialogs = ["ALL_KNOWN_AND_UNKNOWN_DIALOGS"]
+auto_allow_permissions = true
+auto_disable_questions = true
+cli_args = """--dangerously-skip-permissions --disallowed-tools ExitPlanMode,TodoWrite,TaskCreate,TaskList,TaskUpdate"""
+# fastMode defaults OFF here so every NON-interactive agent runs at standard
+# speed -- every claude role (caretaker, automation, worker) resolves to this
+# type, so they all inherit it. Fast mode buys latency at a higher per-token
+# price, which is worth it only when a human is waiting on the reply.
+# A chat launches fast through the `agent_types.claude.settings_overrides.fastMode=true`
+# setting that `[create_templates.fast]` (below) stacks on its create when the
+# chat's fast mode (off, auto or on; the chat app's data/.apps/chat/chats/<id>/fast_mode.json)
+# calls for it; a running chat's speed follows the mode through the chat app's
+# harnesses/claude/model.py, which writes into that agent's own settings file.
+#
+# That setting targets `claude` rather than `chat` because a create-time setting
+# (a template's `setting__extend` entry, or a `-S` flag) is parsed as its own
+# config layer, without the `parent_type = "claude"` this file gives `chat` --
+# so `chat` resolves against the base agent config, which has no
+# `settings_overrides` field, and the create is rejected. `claude` is registered
+# by the claude plugin, whose config class declares it. A chat create resolves
+# its own config, so overriding the base there never reaches a worker create.
+# This is the canonical explanation; the `fast` template and the CLI-contract
+# test point here rather than repeating it.
+#
+# skipDangerousModePermissionPrompt suppresses Claude Code's bypass-permissions
+# warning dialog (every agent here launches with --dangerously-skip-permissions).
+# It must ride the mngr-managed --settings overlay because nothing provisions the
+# shared ~/.claude/settings.json: in shared config-dir mode mngr writes nothing
+# into the shared dir, and claude itself only creates it lazily.
+# feedbackSurveyRate = 0 and feedbackDrafts = "off" silence Claude Code's session quality
+# survey and feedback drafts: both prompt a human mid-session, which garbles an unattended
+# chat's automated input and output. Same overlay reasoning as skipDangerousModePermissionPrompt.
+# tui = "fullscreen" pins the input bar and any dialog to the pane instead of letting them
+# scroll out of view, so what mngr captures at send time is what is actually holding the
+# input. tmux here runs with `alternate-screen off` (see the tmux.conf written below), so
+# the workspace terminal panel keeps its scrollback either way.
+# model = "opus[1m]" pins claude's model. Two things make it safe: every Anthropic account
+# that can reach Claude Code has Opus, so the slug cannot be rejected by the account; and the
+# `first` create template turns fast mode on for the introductory agent, which needs a model
+# that actually supports it -- so the model and the fast-mode default have to be chosen
+# together rather than left to whatever the account happens to default to.
+#
+# codex is the only other harness with a pin (see agent_types.codex for how its slug is chosen).
+# pi, opencode and antigravity pin nothing: their model sets are per-provider (pi, opencode),
+# so a pin there is a slug that some accounts cannot use, which fails as a hard 400 AND as
+# an empty model bar.
+settings_overrides__extend = {model = "opus[1m]", fastMode = false, skipDangerousModePermissionPrompt = true, feedbackSurveyRate = 0, feedbackDrafts = "off", tui = "fullscreen"}
+# Launch every claude agent through the OOM band wrapper instead of `claude`
+# directly. The wrapper (system/services/oom_priority/bin/agent_oom_launch.py) sets its own
+# oom_score_adj to the user- or worker-agent band, records its pid in the
+# agent-pid registry, then execs the real claude with the args mngr appends
+# (assemble_command splices --settings / --resume / --session-id after this
+# base). Because it execs in place, the band-tagged process IS the claude
+# process and its subprocesses inherit the band -- so earlyoom sheds an agent's
+# subprocesses, then worker agents, then user agents, before any protected
+# service. Tagging the band at launch sets the score before any subprocess is
+# spawned. ${MNGR_AGENT_WORK_DIR:-.} mirrors
+# the OOM Claude hooks' path form; the "main" type overrides command below so
+# its sleeping window-0 is unaffected.
+command = "python3 ${MNGR_AGENT_WORK_DIR:-.}/system/services/oom_priority/bin/agent_oom_launch.py claude"
+# Pin Claude Code to a specific version; the provisioning-time version check
+# refuses to start the agent if the installed binary diverges. Bump this in
+# sync with the CLAUDE_CODE_VERSION default in system/scripts/setup_system.sh.
+version = "2.1.280"
+# Do not provision a per-agent Claude config dir. A claude is bound to a
+# provider account on its `mngr create` by CLAUDE_CONFIG_DIR pointing at that
+# account's folder under ~/.minds/accounts (the chat app's own creates, and the
+# [commands.create] env default in .mngr/settings.local.toml for every other
+# create), so auth and sessions live per account; nothing sets the variable in
+# the host env, and ~/.claude holds no credential.
+isolate_local_config_dir = false
+# Claude-only instructions, appended to every claude agent's system prompt.
+append_system_prompt__extend = ["""# Claude-specific instructions
+
+Your built-in `TodoWrite` tool is disabled. Use `tk` instead -- step records (`tk create --step "..."`) are the replacement for `TodoWrite`. Do not use any other built-in memory or task-planning tools; `tk` is the only task tracker in this workspace.
+
+`.claude/skills` does not exist; it is symlinked to `.agents/skills/`.
+
+Use your built-in memory system. Your memory directory is `data/memories/` (configured via `autoMemoryDirectory` in `.claude/settings.json`)."""]
+
+# The "main" (services) agent type -- a plain `command` agent, NOT a claude
+# agent. No claude ever runs as this agent: window 0 only sleeps while the
+# bootstrap window (extra_window) runs supervisord, which owns every background
+# service, and the real chat agents are spun up separately by the bootstrap.
+# Making window 0 a live claude would be unsafe: the user could close it,
+# tearing down the tmux session (and supervisord with it).
+#
+# Because it is not a claude agent, mngr does no claude provisioning for it --
+# in particular it gets no per-agent CLAUDE_CONFIG_DIR in its env, so
+# supervisord services (and any `mngr create` they run) inherit an environment
+# with the var unset, and a create they run binds through the workspace's
+# create defaults in .mngr/settings.local.toml (see [commands.create] above)
+# rather than through anything inherited. Nothing from the invoking user's
+# ~/.claude/ or ~/.mngr/ leaks into the workspace: the repo at the requested
+# git ref is the canonical workspace definition, and command agents sync no
+# user-local claude state at all.
+[agent_types.main]
+parent_type = "command"
+command = "sleep infinity"
+
+# the "codex" agent type -- OpenAI Codex CLI as a peer harness to claude. It is
+# its own base type (registered by the imbue-mngr-codex plugin, installed
+# with the mngr tool by system/scripts/build_workspace.sh), so no parent_type. Auto-approve
+# + auto-dismiss so the container agent runs unattended, matching
+# agent_types.claude's posture (auto_allow_permissions sets codex
+# approval_policy="never"). The codex binary is baked into the image
+# (system/scripts/setup_system.sh, CODEX_VERSION), so check_installation is off -- do not
+# reinstall/verify at provision.
+#
+# model = "gpt-6-sol" makes GPT-6 Sol the model every new codex agent starts on; left unset,
+# codex takes the first model of its account's server catalog, which is GPT-6 Astra. A chat
+# can still switch to any model its account offers from the model bar.
+#
+# A codex slug is a property of the ACCOUNT, not the workspace: which models a ChatGPT plan
+# may use varies by tier, and a slug the account cannot use is a hard 400 on every turn ("The
+# 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account") that also
+# leaves the model bar showing a shrug. gpt-6-sol needs codex >= 0.155.0 (CODEX_VERSION) and
+# is listed for every plan GPT-6 Astra is except `promax`, so a promax account's codex agents
+# get that 400, and only `/model` in the agent terminal recovers them: the model bar offers no
+# switch while the current model is missing from the account's list. No effort is pinned, so
+# the model's own default (medium) applies.
+#
+# sandbox_mode = danger-full-access disables codex's own OS sandbox. On Linux codex
+# sandboxes exec via bubblewrap, but the bundled bwrap cannot set up its network
+# namespace inside the Modal/gVisor agent container (every exec fails with
+# `bwrap: loopback: Failed RTM_NEWADDR: No child process`). The container is already
+# the isolation boundary -- same reason agent_types.claude runs
+# --dangerously-skip-permissions -- so codex's nested sandbox is both redundant and
+# broken here. Turning it off lets exec actually run.
+[agent_types.codex]
+# Extra provisioning runs after mngr writes this agent's isolated Codex config,
+# before startup. Applies to chats and workers; reviewer settings still decide
+# which gates run. Do not install into the shared account/auth CODEX_HOME.
+extra_provision_command__extend = ["bash system/scripts/codex_update_plugin.sh"]
+# Launch through the OOM band wrapper, exactly as claude does above -- without it an
+# agent runs unbanded and earlyoom sheds it by kernel score instead of by our tiering.
+# The wrapper execs codex's native binary in place (not the npm entry point, which runs
+# it as a child), so process detection still matches `codex`.
+# Note codex uses this base for BOTH its visible `--remote` TUI and its `app-server`
+# daemon, so both are banded (the daemon is where turns run, so it is the one that
+# matters for memory).
+command = "python3 ${MNGR_AGENT_WORK_DIR:-.}/system/services/oom_priority/bin/agent_oom_launch.py codex"
+auto_dismiss_dialogs_at_startup = true
+auto_allow_permissions = true
+sandbox_mode = "danger-full-access"
+check_installation = false
+model = "gpt-6-sol"
+# config_overrides is dumped verbatim into codex's own config.toml, so these are codex's
+# own keys, not mngr fields -- kept here on the agent-type block for one place to read.
+# - memories = false: disable codex's built-in memory system so it never writes to
+#   $CODEX_HOME/memories/ -- a per-agent, non-runtime-backed silo that would compete with the
+#   shared runtime/memory/. features.memories is the master switch; false wins regardless of
+#   any [memories] settings.
+# - code_mode_only / code_mode_host (plus the top-level flag below): pin the tool surface
+#   to code mode (`tools.<fn>({...})`, the schema our tool labels parse). The surface normally
+#   comes from the model's `tool_mode` in the remote /models catalog (300s TTL); a server-side
+#   change or an unrecognized value deserializes to None and silently drops us to direct tool
+#   calls. `effective_tool_mode` falls back to these flags exactly when `tool_mode` is None, so
+#   they close that hole (`code_mode_only` implies `code_mode`; it is Stage::UnderDevelopment,
+#   which only warns -- the top-level `suppress_unstable_features_warning` silences that; codex
+#   ignores it under [features]). `code_mode_host` picks where the JS runs (standalone host vs
+#   embedded V8), unrelated to whether code mode is on.
+# - unified_exec_tty = false: closes a TOTAL bypass of the PreToolUse guards. `write_stdin`
+#   fires NO PreToolUse event at all, so an agent could start a shell with one guarded call and
+#   then type anything into it -- `git rebase`, a piped `head`, a batched `tk start` -- with
+#   every guard skipped. With tty off, exec_command rejects `tty: true` and runs every process
+#   with its stdin closed, so `write_stdin` can only poll a running command or send it an
+#   interrupt. Long-running commands still yield and can be polled. Do not reach for
+#   `unified_exec = false` instead: codex >= 0.154 forces unified exec back on unless a managed
+#   requirements file pins it, so that flag is silently ignored. Nor the tools table below:
+#   `ToolsToml` accepts only web_search / experimental_request_user_input / update_plan.
+# - features.goals = false, and tools.{update_plan, experimental_request_user_input,
+#   web_search}.enabled = false: turn off codex surfaces the chat does not use -- codex's own
+#   goals/plan UI (we drive tk), its interactive request-user-input tool, and web search --
+#   so they never appear in the transcript.
+# - apps = false: disable ChatGPT account app/connector sync -- it's an OAuth side channel
+#   to third-party services that bypasses the latchkey gateway (codex's counterpart of
+#   ENABLE_CLAUDEAI_MCP_SERVERS=false above). Plugin skills and hooks are unaffected.
+config_overrides.suppress_unstable_features_warning = true
+# gpt-6-sol's catalog entry defaults to the `priority` (fast) tier, and codex's TUI applies a
+# model's default tier to every turn typed in the agent terminal when no tier is configured. So
+# pin standard speed; the `fast` create template's config_overrides__extend replaces it.
+config_overrides.service_tier = "default"
+config_overrides.features = { memories = false, code_mode_only = true, code_mode_host = true, goals = false, unified_exec_tty = false, apps = false }
+config_overrides.tools = { update_plan = { enabled = false }, experimental_request_user_input = { enabled = false }, web_search = { enabled = false } }
+# Keep source and enablement through mngr's config rewrite. Codex refuses to
+# re-add a cached Git marketplace if its source declaration has disappeared.
+config_overrides.marketplaces.imbue-code-guardian = { source_type = "git", source = "https://github.com/imbue-ai/code-guardian.git", ref = "main" }
+config_overrides.plugins."imbue-code-guardian@imbue-code-guardian" = { enabled = true }
+# Codex-only instructions, appended to every codex agent's system prompt.
+append_system_prompt__extend = ["""# Codex-specific instructions
+
+Do NOT use your built-in `update_plan` tool, your `create_goal`/`get_goal`/`update_goal` tools, or your `request_user_input` tool. Their output and effects never reach the user's workspace chat -- a plan or goal recorded there is invisible to the user, and a `request_user_input` prompt blocks on a terminal nobody is watching (and submits empty answers when it times out). Track every plan and step with `tk` step records, and when you need something from the user, write it as an ordinary chat message and stop -- their reply comes back as your next turn.
+
+Run every shell command as its own `exec_command`. Do NOT start a long-lived interactive shell and feed commands into its stdin: commands delivered that way bypass this workspace's command guards, so a mistake they would have caught reaches the repo instead."""]
+
+# the "pi-coding" agent type -- Pi coding CLI as a peer harness (short alias `pi`).
+# Registered by the imbue-mngr-pi-coding plugin; the pi binary is baked
+# into the image (system/scripts/setup_system.sh, PI_VERSION), so check_installation
+# is off.
+#
+# No model is pinned here: pi is many-provider,
+# many-auth. Its model (`provider/model`) and effort (thinking level: off..max)
+# come from the user's pi settings / launch args, not an mngr-forced slug; the chat
+# model bar reads the live values via the pi lifecycle extension. The one default the
+# workspace supplies is pi's own `defaultProvider` / `defaultModel` pair, seeded into
+# ~/.pi/agent/settings.json by system/scripts/seed_home_skeleton.sh (OpenRouter's
+# GLM 5.3), which pi only honors when that provider has a key.
+#
+# auto_allow_permissions MUST be true -- pi has no approval gate and its config
+# validator rejects false. auto_dismiss_dialogs_at_startup adds pi's `--approve` (trust
+# project-local files for the run) so an unattended agent is not blocked on the
+# first-run trust dialog, matching agent_types.codex's auto_dismiss_dialogs_at_startup.
+[agent_types.pi-coding]
+# Launch through the OOM band wrapper -- see the codex block above. The wrapper execs
+# `pi` in place, and mngr's own prelude/`-e <extension>` splice after this base.
+command = "python3 ${MNGR_AGENT_WORK_DIR:-.}/system/services/oom_priority/bin/agent_oom_launch.py pi"
+auto_allow_permissions = true
+# Share the one ~/.pi/agent/npm dir (symlink) instead of copying it per agent. pi loads
+# its extensions as TypeScript through jiti, whose transpile cache is keyed by absolute
+# path -- a per-agent copy sits at a unique path and misses, so every new agent
+# re-transpiles the whole extension set (~16-24s). Sharing the one stable path lets that
+# cache hit, cutting extension-heavy startup from ~30s to ~10s. Safe here because both
+# extensions are baked into the image (seed_home_skeleton.sh), so pi never installs into
+# -- and never has to write to -- the shared tree. The boot warm-up in seed_home_skeleton.sh
+# fills the cache once so even the FIRST agent after a boot is fast.
+share_home_npm_dir = true
+auto_dismiss_dialogs_at_startup = true
+check_installation = false
+# Harness-only instructions, appended to every pi agent's system prompt.
+append_system_prompt__extend = ["""Do not use any built-in tools related to memory or task planning -- their output does not reach the user's workspace chat. Use the `tk` utility for any todos; it is the only task tracker in this workspace. Don't ever use tools for asking user questions or anything that would block the terminal -- just use your words."""]
+
+# the "opencode" agent type -- OpenCode CLI as a peer harness to claude/codex. It
+# is its own base type (registered by the imbue-mngr-opencode plugin, installed
+# with the mngr tool by system/scripts/build_workspace.sh), so no parent_type. The
+# opencode binary is baked into the image (system/scripts/setup_system.sh,
+# OPENCODE_VERSION), so check_installation is off -- do not reinstall/verify at
+# provision.
+#
+# No model is pinned -- as with pi and antigravity. OpenCode is a
+# many-provider, many-auth harness: its model is a `provider/model` slug that comes
+# from the user's own opencode.json (synced from ~/.config/opencode by the plugin)
+# or the authenticated provider's default -- forcing a slug here could name a
+# provider the user has not authenticated. The chat model bar reads the live value
+# from the harness's own model_state.json instead. "Effort" for opencode is its
+# variant system (provider.<p>.models.<m>.variants.<name>), likewise user-config
+# driven, so it is not pinned here either.
+#
+# auto_allow_permissions injects a wildcard permission-allow into the per-agent
+# opencode.json so the container agent runs unattended, matching
+# agent_types.codex's auto_allow_permissions posture.
+[agent_types.opencode]
+auto_allow_permissions = true
+check_installation = false
+# Launch through the OOM band wrapper, like every other harness. opencode is the one
+# harness whose `command` is not a launch PREFIX but the binary itself: the plugin passes
+# it through as MNGR_OPENCODE_BIN and opencode_launch.sh invokes it for BOTH the server
+# and the attached TUI, so both Bun processes land in the band (the same two-pids-per-agent
+# shape codex has). That script word-splits the value for exactly this reason.
+command = "python3 ${MNGR_AGENT_WORK_DIR:-.}/system/services/oom_priority/bin/agent_oom_launch.py opencode"
+# Harness-only instructions, appended to every opencode agent's system prompt.
+append_system_prompt__extend = ["""Do not use any built-in tools related to memory or task planning -- their output does not reach the user's workspace chat. Use the `tk` utility for any todos; it is the only task tracker in this workspace. Don't ever use tools for asking user questions or anything that would block the terminal -- just use your words."""]
+
+# the "antigravity" agent type -- Google's Antigravity CLI (agy) as a peer harness to
+# claude/codex. Its own base type (registered by the imbue-mngr-antigravity
+# plugin, installed with the mngr tool by system/scripts/build_workspace.sh), so no parent_type.
+# The agy binary is baked into the image (system/scripts/setup_system.sh, which runs the
+# version-locked system/scripts/agy_install-1.1.22.sh), so check_installation is off.
+# auto_allow_permissions + auto_dismiss_dialogs_at_startup run the container agent unattended,
+# matching agent_types.codex (auto_allow adds agy's --dangerously-skip-permissions;
+# auto_dismiss silently trusts the source repo). update_policy = NEVER freezes the baked
+# build -- agy has no version field of its own, so NEVER sets AGY_CLI_DISABLE_AUTO_UPDATE
+# in the agent env and the pin in the installer script stays the only version authority.
+#
+# NO model is pinned, deliberately. agy is single-auth, so a slug WOULD be safe to force,
+# but the model bar is uniform across harnesses now: the harness writes its live model to
+# model_state.json over the session and the harness-agnostic code matches that against the
+# catalog. Pinning a slug here would add a second, competing source of truth that goes
+# stale the moment someone runs /model in the agent's terminal.
+#
+# settings_overrides is folded (last) into the per-agent settings.json -- the agy analog of
+# agent_types.codex's config_overrides. These turn off surfaces a headless chat does not
+# use: enableTerminalSandbox=false keeps run_command unrestricted (the container is already
+# the isolation boundary, same intent as codex's danger-full-access; agy's terminal sandbox
+# is opt-in anyway, so this is belt-and-suspenders), and telemetry / tips / feedback-survey
+# / notifications off keep the surface quiet.
+[agent_types.antigravity]
+auto_allow_permissions = true
+auto_dismiss_dialogs_at_startup = true
+check_installation = false
+update_policy = "NEVER"
+# Launch through the OOM band wrapper, like every other harness. agy takes it as a plain
+# prefix (its `command` is the base of assemble_command, which the plugin then wraps in
+# `env HOME=<per-agent>`), so this is the same shape as claude and pi -- one exec, one pid.
+command = "python3 ${MNGR_AGENT_WORK_DIR:-.}/system/services/oom_priority/bin/agent_oom_launch.py agy"
+settings_overrides = { enableTerminalSandbox = false, enableTelemetry = false, showTips = false, showFeedbackSurvey = false, notifications = false }
+# Harness-only instructions, appended to every antigravity agent's system prompt.
+append_system_prompt__extend = ["""Do not use any built-in tools related to memory or task planning -- their output does not reach the user's workspace chat. Use the `tk` utility for any todos; it is the only task tracker in this workspace. Don't ever use tools for asking user questions or anything that would block the terminal -- just use your words."""]
+
+# Provider configurations
+
+# all disabled for now, since we don't want the agents to be able to launch mngr agents anywhere except within their own containers
+
+# Applies to mngr commands run from the workspace root INSIDE the container
+# (project config is cwd-based), where `local` is the only enabled provider.
+# The in-container `mngr observe` discovery poll is purely a reconciliation
+# sweep -- creates/destroys/renames arrive through the incremental discovery
+# log, and local agent process death through observe's PID watchers -- so it
+# only catches out-of-band changes (e.g. a tmux session killed by hand) and
+# can run rarely: each poll costs file reads plus tmux forks, which is what
+# makes it matter at idle (~3x as expensive under gVisor).
+[providers.local]
+discovery_poll_interval_seconds = 60.0
+
+[providers.modal]
+is_enabled = false
+
+[providers.docker]
+is_enabled = false
+isolate_host_volumes = true
+# The user-data layout: the per-host volume mounts at /home/user (the ONE
+# persistent tree) with mngr's data dir hidden inside it, and mngr's
+# plain-text service logs go to /var/log/mngr (regenerable diagnostics,
+# never backed up).
+host_dir = "/home/user/.mngr"
+volume_mount_path = "/home/user"
+host_log_dir = "/var/log/mngr"
+# No `ssh_bind_address` is set here: mngr's default already publishes each
+# container's sshd on loopback for a local daemon, and on the daemon host's
+# interfaces for a remote one (`host = "ssh://..."` in the user's config), where
+# a loopback bind would be unreachable.
+# No `docker_runtime` is set here, so containers use Docker's default runtime
+# (runc), which is available everywhere -- notably macOS, where gVisor's `runsc`
+# is not. The gVisor-hardened runtime is selected per-create by stacking the
+# `docker_runsc` template overlay below (the minds desktop app does this by
+# default on Linux, where `runsc` is installed). A direct CLI user can opt in
+# with `--template docker --template docker_runsc`, or override either way with
+# MNGR__PROVIDERS__DOCKER__DOCKER_RUNTIME=<runc|runsc>.
+# Mount /run as a tmpfs so supervisord can install its control socket. When runsc
+# is registered with --overlay2=none (required so the container rootfs -- and
+# mngr's SSH provisioning written to it -- survives a restart), /run lives on
+# gVisor's gofer-backed filesystem, which returns EOPNOTSUPP for os.link() of a
+# socket inode. supervisord installs its control socket via a hard link, so on a
+# gofer-backed /run it wedges ("Unlinking stale socket") and never starts
+# system_interface -- the workspace then sits on the "Loading workspace" loader
+# forever. A tmpfs /run makes the hard link work. The same two mounts are applied
+# by the aws-<region> provider start args and by the imbue_cloud slice bake's
+# per-box `-S providers.imbue_cloud_slice.default_start_args` overrides (gen-2
+# slices run under runsc from the bake).
+# /tmp is tmpfs for the same reason as /run: nothing in an ephemeral dir may
+# persist or ride a backup. It says `exec` because Docker mounts a bare
+# `--tmpfs` noexec, and a stub executable a test writes under /tmp and puts on
+# PATH is then skipped, so the real binary it stands in for runs instead.
+default_start_args = ["--tmpfs", "/run", "--tmpfs", "/tmp:exec"]
+
+[providers.lima]
+# is_enabled=false (mirrors [providers.docker]) is load-bearing: the lima backend
+# is a plugin (imbue-mngr-lima) that is NOT installed in the agent container, so a
+# *parsed* lima block would crash the in-container mngr with "unknown backend
+# 'lima'". With is_enabled=false the config loader skips the whole block wherever
+# the lima plugin is absent (the container), while the host-side mngr (which has
+# the plugin) still parses it. The lima create still works because `@<name>.lima`
+# resolves the provider by name regardless of is_enabled (same as @<name>.docker).
+is_enabled = false
+# Run the minds workspace directly in the Lima VM as root (uid 0) -- no nested
+# Docker container. is_run_as_root gives the agent the same "no sudo, install
+# anything" posture it has inside a docker/vps_docker container (the VM is the
+# isolation boundary). Root cannot traverse the 9p bind mount, so is_run_as_root
+# requires the in-VM btrfs additional-disk layout: is_host_data_volume_exposed
+# must be false. These live on the provider block (not the lima template's
+# setting__extend) because template `--setting` entries don't reach provider
+# config (imbue-ai/mngr#1914).
+is_host_data_volume_exposed = false
+is_run_as_root = true
+# The user-data layout (matching the docker provider): /home/user symlinks to
+# the btrfs data disk with mngr's data dir inside it; plain-text mngr service
+# logs go to /var/log/mngr.
+host_dir = "/home/user/.mngr"
+volume_home_path = "/home/user"
+host_log_dir = "/var/log/mngr"
+# Pin the Lima guest to the same Debian release the docker image uses (trixie),
+# so setup_system.sh provisions an identical toolchain everywhere. Set here
+# (dwt-side) rather than bumping mngr_lima's bookworm default, which outside
+# mngr users keep. Served from imbue's artifact mirror rather than
+# cloud.debian.org, which prunes old releases: the same image release the
+# gen-2 cloud slices boot (mngr's apps/minds_admin/.../slices/mirror_artifacts.py
+# is the manifest; bump both together, uploading the new release with
+# `minds-admin artifacts upload` before landing the bump here).
+default_image_url_aarch64 = "https://apt.imbuepackages.com/artifacts/debian-cloud-image/20260722-2547/debian-13-genericcloud-arm64-20260722-2547.qcow2"
+default_image_url_x86_64 = "https://apt.imbuepackages.com/artifacts/debian-cloud-image/20260722-2547/debian-13-genericcloud-amd64-20260722-2547.qcow2"
+
+# vultr VPS provider (cloud mode). is_enabled=false mirrors the lima/docker blocks:
+# the vps_docker backend plugin is not installed in the agent container, so a parsed
+# block would crash the in-container mngr; with is_enabled=false the loader skips the
+# block where the plugin is absent, while the host-side mngr (which runs the bake)
+# still parses it. The vultr create still works because `@<name>.vultr` resolves the
+# provider by name regardless of is_enabled. runsc is installed+registered at
+# provisioning time and selected for the agent container; the matching `--workdir=/`
+# and `--security-opt=no-new-privileges` run args are added in the vultr template's
+# start_arg (which, unlike lima, reaches the inner `docker run`).
+[providers.vultr]
+is_enabled = false
+install_gvisor_runtime = true
+docker_runtime = "runsc"
+# The user-data layout (matching the docker provider): /home/user symlinks
+# onto the unified volume's home/ subdir with mngr's data dir inside it;
+# plain-text mngr service logs go to /var/log/mngr.
+host_dir = "/home/user/.mngr"
+volume_home_path = "/home/user"
+host_log_dir = "/var/log/mngr"
+
+# OVH VPS provider (the imbue-cloud pool-bake's default). Same rationale as the
+# vultr block above; the `--workdir=/` / `--security-opt=no-new-privileges` run args
+# are added in the ovh template's start_arg.
+[providers.ovh]
+is_enabled = false
+install_gvisor_runtime = true
+docker_runtime = "runsc"
+# The user-data layout (matching the docker provider): /home/user symlinks
+# onto the unified volume's home/ subdir with mngr's data dir inside it;
+# plain-text mngr service logs go to /var/log/mngr.
+host_dir = "/home/user/.mngr"
+volume_home_path = "/home/user"
+host_log_dir = "/var/log/mngr"
+
+# imbue-cloud bare-metal slice provider (the lima-VM analog of the ovh pool
+# path; the slice bake selects it by create address and passes carve sizing via
+# `-S providers.imbue_cloud_slice.*`). It needs the same user-data-layout knobs
+# as the ovh/vultr blocks: the pool bake creates the services agent with
+# MNGR_HOST_DIR=/home/user/.mngr, so without these the outer provider writes
+# agent state at the legacy /mngr while the workspace (and the bake's finalize
+# `mngr stop`) look in /home/user/.mngr.
+#
+# `is_enabled = false` (like ovh/vultr) is what lets the IN-WORKSPACE mngr --
+# which has only the core plugins installed -- skip this block instead of
+# failing on the unknown backend; the bake's create address still selects the
+# provider on the operator side, where mngr_imbue_cloud is installed.
+[providers.imbue_cloud_slice]
+is_enabled = false
+host_dir = "/home/user/.mngr"
+volume_home_path = "/home/user"
+host_log_dir = "/var/log/mngr"
+
+# Create templates
+
+## these are all for launching the original agent (from outside the sandbox, in the first place)
+
+# the template that is shared across all agent types
+[create_templates.main]
+type = "main"
+# bootstrap is the only extra_window now. It runs first-boot setup (git config)
+# and then launches
+# supervisord, which runs every background service (system_interface, web,
+# share-gateway, app-watcher, host-backup, terminal, and the one-shot
+# deferred-install -- see system/supervisord.conf; the opt-in github-sync service is
+# added by its skill). The old git_auth_setup window is gone (the git config
+# it performed now runs inside bootstrap), and terminal is a supervisord
+# service rather than its own window.
+extra_window = ["bootstrap='uv run bootstrap'"]
+# Write a sane default tmux config on every minds host. tuple-typed
+# `extra_provision_command` stacks across templates (see
+# `apply_create_template` in mngr's cli/common_opts.py), so the
+# mode-specific templates (docker/lima/...) keep their own commands.
+#
+# `mouse on` keeps wheel scroll and in-app mouse working in the browser
+# terminal. The clipboard lines make a plain mouse-drag copy reach the system
+# clipboard via OSC 52: `set-clipboard on` tells tmux to emit it,
+# `terminal-features ,*:clipboard` makes tmux believe the terminal accepts it,
+# and the copy-mode bindings copy-and-emit on drag-release. This relies on the
+# mngr_ttyd plugin serving an OSC 52-capable web client (the stock ttyd client
+# drops these escapes); see libs/mngr_ttyd in the mngr repo.
+#
+# The final `if-shell ... source-file` line pulls in system/apps/terminal/terminal_tmux.conf
+# (committed to /home/user/workspace), which holds the in-memory-persistent-terminals
+# settings: a larger history-limit, window-size latest, and the tab-title
+# tracking hooks. It lives in its own file so those hook lines stay readable.
+extra_provision_command__extend = [
+    '''printf '%s\n' 'set -g alternate-screen off' 'set -g mouse on' 'set -g set-clipboard on' 'set -as terminal-features ,*:clipboard' 'bind -T copy-mode MouseDragEnd1Pane send -X copy-pipe-and-cancel' 'bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-pipe-and-cancel' 'if-shell "test -f /home/user/workspace/system/apps/terminal/terminal_tmux.conf" "source-file /home/user/workspace/system/apps/terminal/terminal_tmux.conf"' > "$HOME/.tmux.conf"''',
+]
+
+# Shared base template for the local docker provider. Used on its own for the
+# default (runc) runtime; stack `--template docker_runsc` on top of it to select
+# the gVisor (runsc) runtime instead (see that overlay below and the
+# [providers.docker] note above). The container-runtime choice is the only
+# difference between the two, so the body lives here once and the overlay reuses
+# it -- nothing to keep in sync.
+[create_templates.docker]
+provider = "docker"
+target_path = "/home/user/workspace/"
+setting__extend = ["providers.docker.is_enabled=true"]
+# While pyproject.toml pins mngr from the private mngr-internal repo, every docker
+# build_arg here carries a `--secret=id=mngr_internal_git_token,...` element that
+# hands the build its credential; system/scripts/set_mngr_pin.py adds it with
+# such a pin and removes it with a public one, because the flag needs BuildKit
+# (docker buildx), which a public pin must not require. Never edit it by hand.
+build_arg__extend = ["--file=system/Dockerfile", "."]
+# Security hardening for `docker run`: block privilege escalation via setuid
+# binaries. `--cap-add=SYS_PTRACE` was removed deliberately -- gVisor is the
+# isolation boundary now, and the extra capability widened the container's
+# privileges with no upside for untrusted agents.
+#
+# `--workdir=/` overrides the image's `WORKDIR /home/user/workspace` for the container's
+# idle entrypoint. Under gVisor (runsc), sandbox startup tries to create the
+# process working directory and aborts with "file exists" when it already
+# exists -- and `/home/user/workspace` exists inside the mounted `/home/user` volume. runc
+# tolerates a pre-existing cwd; runsc does not. Pointing the cwd at `/` (always
+# present) sidesteps it; nothing depends on the host container's default cwd
+# (the entrypoint just sleeps; agents set their own work_dir=/home/user/workspace).
+#
+# `--restart=unless-stopped` brings the container back after a docker daemon
+# restart or host reboot; the container entrypoint then self-heals sshd, so the
+# host is reachable again without a manual `mngr start`. The agent itself is
+# relaunched by the minds desktop client in this (debugging-oriented) mode.
+start_arg__extend = ["--security-opt=no-new-privileges", "--workdir=/", "--restart=unless-stopped"]
+# Disable idle detection entirely -- the host should never auto-shutdown.
+# This also prevents shutdown when all agent tmux sessions exit.
+idle_mode = "disabled"
+# Seed /home/user/workspace from /docker_build_code (baked into the image) onto the
+# per-host volume. Runs synchronously after the host is online but
+# before any agent work_dir setup, so the workspace is in place by the
+# time the user's git refs land on top. See system/scripts/default_workspace_template_seed.sh.
+post_host_create_command__extend = ["/usr/local/bin/default-workspace-template-seed"]
+
+# gVisor (runsc) runtime overlay for the docker provider. Always stacked on top
+# of `docker` (`--template docker --template docker_runsc`): it reuses the entire
+# docker template body and only switches the provider's container runtime to
+# `runsc`, shrinking the host kernel attack surface for untrusted agents. `runsc`
+# must be installed + registered with the local Docker daemon (see CLAUDE.md);
+# container creation fails with Docker's native "unknown runtime" error
+# otherwise -- which is why this is opt-in rather than the default. The
+# template-contributed provider-config setting reaches the provider at create
+# time: mngr re-applies template `--setting` entries against the provider config
+# after template resolution (imbue-ai/mngr#1914).
+[create_templates.docker_runsc]
+setting__extend = ["providers.docker.docker_runtime=runsc"]
+
+# template for lima VM provider
+[create_templates.lima]
+provider = "lima"
+target_path = "/home/user/workspace/"
+idle_mode = "disabled"
+start_arg__extend = ["--cpus=2", "--memory=4", "--disk=20"]
+# Mirror the docker template: flip the (default-disabled) lima provider on for
+# this create. Redundant in practice -- `@<name>.lima` resolves the provider by
+# name regardless of is_enabled -- but kept for parity/intent with docker.
+# (Docker-in-Lima mode and its is_host_in_docker provider config are gone; the
+# agent now runs directly in the VM as root -- see [providers.lima]. Offline
+# reads via `mngr event` / `mngr transcript` against a stopped Lima host do not
+# work in the btrfs layout until the host is started.)
+#
+# The pinned claude binary is installed on the fresh VM during provisioning by
+# the claude plugin itself (is_remote_agent_installation_allowed defaults to
+# True, so a missing remote claude is auto-installed at the pinned version);
+# setup_system.sh below then re-installs it as part of the full toolchain. No
+# version-check disable is needed.
+setting__extend = ["providers.lima.is_enabled=true"]
+# Run the SAME setup as a Dockerfile-built workspace, directly in the VM as root.
+# These run after the project is synced to /home/user/workspace (agent-level provisioning,
+# post work_dir sync) and reuse the exact scripts the Dockerfile RUNs. There is
+# no docker build (so no `--file=system/Dockerfile` build arg) and no /docker_build_code
+# relocation (the repo lands straight on the VM's btrfs /home/user disk), so the
+# docker template's build_arg + post_host_create_command (default-workspace-template-seed) are
+# intentionally absent here. extra_provision_command__extend stacks after the
+# main template's entry.
+extra_provision_command__extend = [
+    # Move root's home to the persistent /home/user tree (the Dockerfile does
+    # this for container images; VM/sandbox provisioning does it here) so
+    # $HOME, passwd, and sshd agree. /var/cache/user is the off-volume cache
+    # target the host env points XDG_CACHE_HOME / npm_config_cache at.
+    # (Direct passwd edit rather than `usermod -d`: usermod refuses to modify
+    # a user with running processes, and root always has one here.)
+    "sed -i 's|^root:\\([^:]*:[^:]*:[^:]*:[^:]*\\):/root:|root:\\1:/home/user:|' /etc/passwd && grep -q '^root:.*:/home/user:' /etc/passwd && mkdir -p /home/user /var/cache/user",
+    "bash /home/user/workspace/system/scripts/setup_system.sh",
+    "bash /home/user/workspace/system/scripts/install_dependencies.sh",
+    "bash /home/user/workspace/system/scripts/build_workspace.sh",
+    # The creator uploads a credential for a private mngr pin to this path before
+    # the commands above run; build_workspace.sh is its last reader, so it goes
+    # here, before anything else runs. A no-op for a public pin.
+    "rm -f /run/secrets/mngr_internal_git_token",
+    # Same home-skeleton seeding the docker first-boot seed performs
+    # (~/worktrees, ~/.cache symlink, ~/.bashrc, layout-version stamp).
+    "sh /home/user/workspace/system/scripts/seed_home_skeleton.sh",
+    # Install a systemd unit that relaunches the system-services agent on VM
+    # boot, so the workspace recovers from a VM reboot even when the minds
+    # desktop app is not running. The agent runs directly in the VM here, so
+    # this runs `mngr start system-services` in the VM (mngr is installed by
+    # build_workspace.sh above).
+    "bash /home/user/workspace/system/scripts/minds_lima_autostart.sh",
+]
+
+# template for the Modal sandbox provider (the "modal" compute provider).
+# Like Lima, Modal has no Dockerfile build -- the toolchain is provisioned over SSH
+# after the sandbox boots, reusing the exact scripts the Dockerfile RUNs. There is
+# no autostart unit: Modal sandboxes are ephemeral (~1 day) and do not survive a
+# reboot, so the minds desktop app re-creates them rather than relying on systemd
+# (the lima-autostart step is intentionally absent). Sizing + timeouts are set in
+# this template's setting__extend (below), not in the mngr_modal provider defaults.
+[create_templates.modal]
+provider = "modal"
+target_path = "/home/user/workspace/"
+# Disable idle detection entirely -- the host should never auto-shutdown. The
+# sandbox instead runs until the 24h max-age timeout set in setting__extend below
+# (matching how the vultr/aws/imbue_cloud templates disable idle).
+idle_mode = "disabled"
+# Enable the (default-disabled) modal provider for this create, and set the
+# minds-facing sizing + timeouts HERE rather than in the mngr_modal provider
+# defaults: 2 CPU / 4 GB (matching the lima/docker convention) and a ~24h sandbox
+# timeout. The sandbox timeout (86310) plus the provider's 90s shutdown buffer
+# lands at 86400s (24h), Modal's hard cap. The workspaces an eval run creates
+# instead stack the `modal_eval` overlay below for a shorter timeout, leaving
+# this global template untouched.
+setting__extend = [
+    "providers.modal.is_enabled=true",
+    "providers.modal.default_cpu=2.0",
+    "providers.modal.default_memory=4.0",
+    "providers.modal.default_sandbox_timeout=86310",
+    "providers.modal.default_idle_timeout=86400",
+]
+# Modal has no Dockerfile build (like lima): run the same setup a Dockerfile-built
+# workspace would, directly in the sandbox over SSH.
+extra_provision_command__extend = [
+    # Move root's home to the persistent /home/user tree (the Dockerfile does
+    # this for container images; VM/sandbox provisioning does it here) so
+    # $HOME, passwd, and sshd agree. /var/cache/user is the off-volume cache
+    # target the host env points XDG_CACHE_HOME / npm_config_cache at.
+    # (Direct passwd edit rather than `usermod -d`: usermod refuses to modify
+    # a user with running processes, and root always has one here.)
+    "sed -i 's|^root:\\([^:]*:[^:]*:[^:]*:[^:]*\\):/root:|root:\\1:/home/user:|' /etc/passwd && grep -q '^root:.*:/home/user:' /etc/passwd && mkdir -p /home/user /var/cache/user",
+    "bash /home/user/workspace/system/scripts/setup_system.sh",
+    "bash /home/user/workspace/system/scripts/install_dependencies.sh",
+    "bash /home/user/workspace/system/scripts/build_workspace.sh",
+    # Same credential cleanup as the lima template, at the same point.
+    "rm -f /run/secrets/mngr_internal_git_token",
+    # Same home-skeleton seeding the docker first-boot seed performs
+    # (~/worktrees, ~/.cache symlink, ~/.bashrc, layout-version stamp).
+    "sh /home/user/workspace/system/scripts/seed_home_skeleton.sh",
+]
+
+# Short-timeout overlay for the workspaces an eval run creates. Always stacked on top
+# of `modal` (`--template modal --template modal_eval`), mirroring how `docker_runsc`
+# overlays `docker`: it reuses the entire `modal` body and only shortens the sandbox
+# timeout to 3h (10710 + the provider's 90s shutdown buffer = 10800s). An eval trial
+# tears its own workspaces down when it finishes, so this timeout is the backstop for
+# the case where the driver dies without doing so. The eval harness selects it via the
+# MINDS_MODAL_EXTRA_TEMPLATE env var on the eval box; normal Modal creates use plain
+# `modal` (24h). Keeping it separate leaves the global `modal` template alone.
+[create_templates.modal_eval]
+setting__extend = ["providers.modal.default_sandbox_timeout=10710"]
+
+# template for vultr VPS provider (cloud mode)
+[create_templates.vultr]
+provider = "vultr"
+target_path = "/home/user/workspace/"
+# ``--vps-region=sjc`` (Silicon Valley) instead of the mngr_vultr default
+# ``ewr`` (Newark) -- imbue's operators run the bake from west-coast
+# machines, and the New Jersey region routinely produced ~1s SSH RTTs
+# and ~1.6 MB/s effective rsync throughput, which combined with the
+# ~1500-file build context made the cold upload time out at 10 minutes.
+# Keeping the default change at the template level so every minds /
+# imbue_cloud-pool create lands in the same place; CLI users who want
+# a different region can still override per-invocation with
+# ``-b --vps-region=<other>``.
+build_arg__extend = ["--file=system/Dockerfile", "--vps-plan=vc2-2c-4gb", "--vps-region=sjc", "."]
+# Disable idle detection entirely -- the host should never auto-shutdown.
+# This also prevents shutdown when all agent tmux sessions exit.
+idle_mode = "disabled"
+# gVisor runsc hardening for the agent container, matching the docker template.
+# runsc itself is installed+selected on the [providers.vultr] block above; these
+# `docker run` args go via start_arg (vps_docker forwards start_arg to the inner
+# `docker run`): `--workdir=/` (runsc aborts when the image WORKDIR /home/user/workspace,
+# inside the mounted /home/user volume, already exists as the process cwd) and
+# `--security-opt=no-new-privileges`. `--restart=unless-stopped` brings the
+# agent container back after a VPS reboot; the entrypoint then self-heals sshd.
+start_arg__extend = ["--security-opt=no-new-privileges", "--workdir=/", "--restart=unless-stopped"]
+# Same first-boot seed as the docker template; see comment there.
+post_host_create_command__extend = ["/usr/local/bin/default-workspace-template-seed"]
+# Install the outer-VM boot unit so the agent recovers after a VPS reboot even
+# without the desktop app; same as the pool_host template..
+post_host_create_outer_command__extend = [
+    """
+set -eu
+cat > /usr/local/sbin/minds-outer-autostart.sh <<'BOOT'
+#!/bin/sh
+# Start every mngr-managed agent container and relaunch the system-services
+# agent inside it (in its full host+agent env, via the shared in-container
+# start script). Containers are found by the fixed mngr label, so this
+# survives container rebuilds. Triggered by minds-autostart.path once the
+# /mngr-btrfs data volume is ready (mngr-internal#266); the wait below makes
+# a premature trigger park until the mount actually exists instead of
+# failing repeatedly (root-fs debris shadowed under the unmounted mountpoint
+# once satisfied the old glob trigger early -- see the field report on
+# default-workspace-template#381). Any step that still fails makes the unit
+# fail, so breakage is visible in systemd instead of being swallowed.
+# `mngr start` is idempotent + flock-serialized, so racing the desktop
+# client is safe.
+set -u
+
+# Wait for the data volume to actually be mounted: generous hard bound, plus
+# a warning when it took suspiciously long. The trigger normally fires only
+# after the mount, so any wait at all here is unusual; on slices lima can
+# take many minutes to mount the disk on boot. Type=oneshot has no start
+# timeout, so systemd will not kill this wait.
+WAITED=0
+until mountpoint -q "$(readlink -f /mngr-btrfs)"; do
+    if [ "$WAITED" -ge 1800 ]; then
+        echo "timed out after ${WAITED}s waiting for /mngr-btrfs to be mounted" >&2
+        exit 1
+    fi
+    sleep 5
+    WAITED=$((WAITED + 5))
+done
+if [ "$WAITED" -gt 60 ]; then
+    echo "warning: waited ${WAITED}s for /mngr-btrfs to be mounted" >&2
+fi
+
+FAILED=0
+for cid in $(docker ps -aq --filter "label=com.imbue.mngr.host-id"); do
+    docker start "$cid" >/dev/null
+    if [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" != "true" ]; then
+        echo "agent container $cid did not reach running" >&2
+        FAILED=1
+        continue
+    fi
+    # Run the in-container start script from whichever location this
+    # container's generation carries. A container older than the script
+    # itself has none: for those, make sure sshd is up (its entrypoint is a
+    # bare keep-alive) and succeed with a journal notice -- a permanently
+    # missing script must not fail the unit, because the path unit
+    # retriggers a failing oneshot with no rate limit (the unit sets
+    # StartLimitIntervalSec=0 for transient failures), which would hot-loop
+    # forever on a condition that can never clear.
+    # CLEANUP: drop the /mngr/code candidate and the sshd fallback once no
+    # leased workspace container predates minds-v0.3.2 (the first version
+    # that ships minds_start_services_agent.sh).
+    if ! docker exec --workdir / "$cid" bash -lc 'for s in /home/user/workspace/system/scripts/minds_start_services_agent.sh /mngr/code/scripts/minds_start_services_agent.sh; do if test -x "$s"; then exec "$s"; fi; done; mkdir -p /run/sshd; grep -lxs sshd /proc/[0-9]*/comm >/dev/null 2>&1 || /usr/sbin/sshd -o MaxSessions=100 -o MaxStartups=100:30:200 || echo "warning: could not start sshd in this container" >&2; echo "no minds_start_services_agent.sh in this container generation; started container and sshd only" >&2'; then
+        echo "relaunching the services agent in container $cid failed" >&2
+        FAILED=1
+    fi
+done
+exit "$FAILED"
+BOOT
+chmod +x /usr/local/sbin/minds-outer-autostart.sh
+cat > /etc/systemd/system/minds-autostart.service <<'UNIT'
+[Unit]
+Description=Start the minds system-services agent once the data volume is up
+After=docker.service
+Requires=docker.service
+# Never rate-limit starts: while the trigger condition holds, a failing
+# service re-triggers immediately, and hitting the default start limit
+# propagates unit-start-limit-hit to minds-autostart.path -- permanently
+# disabling the watcher (observed on a staging box reboot; see the field
+# report on default-workspace-template#381).
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/minds-outer-autostart.sh
+UNIT
+cat > /etc/systemd/system/minds-autostart.path <<'UNIT'
+[Unit]
+Description=Watch for the mngr data volume and start the minds workspace
+
+[Path]
+# The marker file is created exclusively by this installer, behind a hard
+# mountpoint check, so it can only ever exist on the mounted data volume.
+# The bare /mngr-btrfs symlink persists (dangling) across reboots, and even
+# entries under it cannot be trusted: root-fs debris shadowed beneath the
+# unmounted mountpoint (a stale snapshot-helper request once mkdir'd
+# /mngr-btrfs/snapshots pre-mount) defeated the previous
+# PathExistsGlob=/mngr-btrfs/* condition and fired the service before the
+# volume existed. The wake-up event is the symlink recreation the provision
+# script performs right after mounting on each boot.
+PathExists=/mngr-btrfs/.minds-volume-ready
+Unit=minds-autostart.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+# The readiness marker the path unit watches may only ever be created here,
+# behind a hard mount check, so it can never appear on the unmounted root fs
+# (the way shadow debris under the mountpoint defeated the old glob trigger).
+if ! mountpoint -q "$(readlink -f /mngr-btrfs)"; then
+    echo "refusing to install minds-autostart: /mngr-btrfs is not a mounted volume" >&2
+    exit 1
+fi
+touch /mngr-btrfs/.minds-volume-ready
+# The service is only ever triggered by the path unit, so it cannot run before
+# the data volume exists. Remove any direct boot enablement left by the
+# previous installer (a no-op on fresh VMs), revive units a past boot may have
+# left dead of a start-rate limit (re-running this installer is the fleet
+# backfill path), then enable + start the watcher. Starting the path unit
+# alone does NOT fire the service when it is already active -- the previous
+# installer's boot-time oneshot swallowed its own failures and exited 0, and
+# RemainAfterExit=yes then latches the unit active, which is exactly the
+# state of a VM recovered from a wedge -- so explicitly restart the service
+# to run the start NOW. --no-block keeps this installer fast (the service
+# body may legitimately wait minutes for the data-volume mount), and the run
+# is safe on a healthy workspace (`docker start` and `mngr start` are
+# no-ops).
+rm -f /etc/systemd/system/multi-user.target.wants/minds-autostart.service
+systemctl daemon-reload
+systemctl reset-failed minds-autostart.path minds-autostart.service 2>/dev/null || true
+systemctl enable minds-autostart.path
+systemctl start minds-autostart.path
+systemctl restart --no-block minds-autostart.service
+""",
+]
+
+# Provider-agnostic DEFAULT_WORKSPACE_TEMPLATE pool-host build recipe (the imbue-cloud pool bake stacks
+# this on top of `main` for BOTH OVH VPSes and lima slices -- they build the same
+# container image). No `provider` is declared: the create address selects it
+# (`@host.ovh` for OVH, `@host.imbue_cloud_slice` for a slice), mirroring the
+# `aws` / `imbue_cloud` templates. Declaring `provider = "ovh"` here used to make
+# slice bakes fail ("conflicting providers": the slice address vs this template).
+[create_templates.pool_host]
+target_path = "/home/user/workspace/"
+# No plan / datacenter / sizing baked in: each pool-bake path appends its own per
+# invocation -- the OVH backend appends ``-b --vps-datacenter=<region>`` (plan
+# defaults from ``OvhProviderConfig.default_plan``), the slice backend passes the
+# box address + per-slice carve sizing via ``-S providers.imbue_cloud_slice.*``.
+build_arg__extend = ["--file=system/Dockerfile", "."]
+# Disable idle detection entirely -- the host should never auto-shutdown.
+# This also prevents shutdown when all agent tmux sessions exit.
+idle_mode = "disabled"
+# gVisor runsc hardening for the agent container; see the vultr template comment.
+# runsc is installed+selected by the chosen provider (the OVH/vultr provider block,
+# or the slice VM's own provisioning).
+#
+# `--restart=unless-stopped` brings the agent container back after a pool-VM
+# reboot; the container entrypoint then self-heals sshd. The agent itself is
+# relaunched by the outer boot unit installed below.
+start_arg__extend = ["--security-opt=no-new-privileges", "--workdir=/", "--restart=unless-stopped"]
+# Same first-boot seed as the docker template; see comment there.
+post_host_create_command__extend = ["/usr/local/bin/default-workspace-template-seed"]
+# Install systemd units on the OUTER pool/slice VM that, on every VM boot,
+# start the agent container and relaunch the system-services agent inside it
+# -- so the workspace recovers from a VM reboot even when the minds desktop app
+# is not running. A path unit watches for the /mngr-btrfs data volume and only
+# then triggers the start service: on slices, lima mounts the data disk (and
+# recreates the /mngr-btrfs symlink) at a highly variable point late in boot,
+# so a service ordered merely After=docker.service raced the mount and left
+# the container down until an operator intervened (mngr-internal#266). Same
+# event-driven shape as scripts/minds_lima_autostart.sh, which fixed this race
+# for the lima direct-VM mode. Runs once on the VM (post_host_create_command /
+# default-workspace-template-seed has already seeded /home/user/workspace in
+# the container, so the installer can be copied out of it). The units persist
+# across leases and container rebuilds (the script finds the container by mngr
+# label, not by name).
+post_host_create_outer_command__extend = [
+    """
+set -eu
+cat > /usr/local/sbin/minds-outer-autostart.sh <<'BOOT'
+#!/bin/sh
+# Start every mngr-managed agent container and relaunch the system-services
+# agent inside it (in its full host+agent env, via the shared in-container
+# start script). Containers are found by the fixed mngr label, so this
+# survives container rebuilds. Triggered by minds-autostart.path once the
+# /mngr-btrfs data volume is ready (mngr-internal#266); the wait below makes
+# a premature trigger park until the mount actually exists instead of
+# failing repeatedly (root-fs debris shadowed under the unmounted mountpoint
+# once satisfied the old glob trigger early -- see the field report on
+# default-workspace-template#381). Any step that still fails makes the unit
+# fail, so breakage is visible in systemd instead of being swallowed.
+# `mngr start` is idempotent + flock-serialized, so racing the desktop
+# client is safe.
+set -u
+
+# Wait for the data volume to actually be mounted: generous hard bound, plus
+# a warning when it took suspiciously long. The trigger normally fires only
+# after the mount, so any wait at all here is unusual; on slices lima can
+# take many minutes to mount the disk on boot. Type=oneshot has no start
+# timeout, so systemd will not kill this wait.
+WAITED=0
+until mountpoint -q "$(readlink -f /mngr-btrfs)"; do
+    if [ "$WAITED" -ge 1800 ]; then
+        echo "timed out after ${WAITED}s waiting for /mngr-btrfs to be mounted" >&2
+        exit 1
+    fi
+    sleep 5
+    WAITED=$((WAITED + 5))
+done
+if [ "$WAITED" -gt 60 ]; then
+    echo "warning: waited ${WAITED}s for /mngr-btrfs to be mounted" >&2
+fi
+
+FAILED=0
+for cid in $(docker ps -aq --filter "label=com.imbue.mngr.host-id"); do
+    docker start "$cid" >/dev/null
+    if [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" != "true" ]; then
+        echo "agent container $cid did not reach running" >&2
+        FAILED=1
+        continue
+    fi
+    # Run the in-container start script from whichever location this
+    # container's generation carries. A container older than the script
+    # itself has none: for those, make sure sshd is up (its entrypoint is a
+    # bare keep-alive) and succeed with a journal notice -- a permanently
+    # missing script must not fail the unit, because the path unit
+    # retriggers a failing oneshot with no rate limit (the unit sets
+    # StartLimitIntervalSec=0 for transient failures), which would hot-loop
+    # forever on a condition that can never clear.
+    # CLEANUP: drop the /mngr/code candidate and the sshd fallback once no
+    # leased workspace container predates minds-v0.3.2 (the first version
+    # that ships minds_start_services_agent.sh).
+    if ! docker exec --workdir / "$cid" bash -lc 'for s in /home/user/workspace/system/scripts/minds_start_services_agent.sh /mngr/code/scripts/minds_start_services_agent.sh; do if test -x "$s"; then exec "$s"; fi; done; mkdir -p /run/sshd; grep -lxs sshd /proc/[0-9]*/comm >/dev/null 2>&1 || /usr/sbin/sshd -o MaxSessions=100 -o MaxStartups=100:30:200 || echo "warning: could not start sshd in this container" >&2; echo "no minds_start_services_agent.sh in this container generation; started container and sshd only" >&2'; then
+        echo "relaunching the services agent in container $cid failed" >&2
+        FAILED=1
+    fi
+done
+exit "$FAILED"
+BOOT
+chmod +x /usr/local/sbin/minds-outer-autostart.sh
+cat > /etc/systemd/system/minds-autostart.service <<'UNIT'
+[Unit]
+Description=Start the minds system-services agent once the data volume is up
+After=docker.service
+Requires=docker.service
+# Never rate-limit starts: while the trigger condition holds, a failing
+# service re-triggers immediately, and hitting the default start limit
+# propagates unit-start-limit-hit to minds-autostart.path -- permanently
+# disabling the watcher (observed on a staging box reboot; see the field
+# report on default-workspace-template#381).
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/minds-outer-autostart.sh
+UNIT
+cat > /etc/systemd/system/minds-autostart.path <<'UNIT'
+[Unit]
+Description=Watch for the mngr data volume and start the minds workspace
+
+[Path]
+# The marker file is created exclusively by this installer, behind a hard
+# mountpoint check, so it can only ever exist on the mounted data volume.
+# The bare /mngr-btrfs symlink persists (dangling) across reboots, and even
+# entries under it cannot be trusted: root-fs debris shadowed beneath the
+# unmounted mountpoint (a stale snapshot-helper request once mkdir'd
+# /mngr-btrfs/snapshots pre-mount) defeated the previous
+# PathExistsGlob=/mngr-btrfs/* condition and fired the service before the
+# volume existed. The wake-up event is the symlink recreation the provision
+# script performs right after mounting on each boot.
+PathExists=/mngr-btrfs/.minds-volume-ready
+Unit=minds-autostart.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+# The readiness marker the path unit watches may only ever be created here,
+# behind a hard mount check, so it can never appear on the unmounted root fs
+# (the way shadow debris under the mountpoint defeated the old glob trigger).
+if ! mountpoint -q "$(readlink -f /mngr-btrfs)"; then
+    echo "refusing to install minds-autostart: /mngr-btrfs is not a mounted volume" >&2
+    exit 1
+fi
+touch /mngr-btrfs/.minds-volume-ready
+# The service is only ever triggered by the path unit, so it cannot run before
+# the data volume exists. Remove any direct boot enablement left by the
+# previous installer (a no-op on fresh VMs), revive units a past boot may have
+# left dead of a start-rate limit (re-running this installer is the fleet
+# backfill path), then enable + start the watcher. Starting the path unit
+# alone does NOT fire the service when it is already active -- the previous
+# installer's boot-time oneshot swallowed its own failures and exited 0, and
+# RemainAfterExit=yes then latches the unit active, which is exactly the
+# state of a VM recovered from a wedge -- so explicitly restart the service
+# to run the start NOW. --no-block keeps this installer fast (the service
+# body may legitimately wait minutes for the data-volume mount), and the run
+# is safe on a healthy workspace (`docker start` and `mngr start` are
+# no-ops).
+rm -f /etc/systemd/system/multi-user.target.wants/minds-autostart.service
+systemctl daemon-reload
+systemctl reset-failed minds-autostart.path minds-autostart.service 2>/dev/null || true
+systemctl enable minds-autostart.path
+systemctl start minds-autostart.path
+systemctl restart --no-block minds-autostart.service
+""",
+]
+
+# template for AWS EC2 VPS provider (aws mode)
+[create_templates.aws]
+target_path = "/home/user/workspace/"
+# No `provider` declared: minds addresses the create as
+# `system-services@<host>.aws-<region>`, which selects the region-specific
+# `[providers.aws-<region>]` block minds writes into its mngr profile settings
+# at startup (mirroring how the imbue_cloud template omits `provider` and lets
+# the `imbue_cloud_<slug>` address pick the instance). No region or instance
+# type is baked in: the region comes from the provider block's `default_region`
+# (and the matching `-b --aws-region=` minds passes), the instance type from
+# `AwsProviderConfig.default_instance_type`.
+build_arg__extend = ["--file=system/Dockerfile", "."]
+# Disable idle detection entirely -- the host should never auto-shutdown. The
+# AWS provider's `auto_shutdown_seconds` max-lifetime cap is also left unset
+# (the minds-written provider blocks don't set it), so the EC2 instance stays
+# up for the whole user session rather than self-terminating after a timeout.
+idle_mode = "disabled"
+# gVisor runsc hardening for the agent container, matching the vultr/ovh
+# templates. runsc is installed+selected via `install_gvisor_runtime` /
+# `docker_runtime` on the minds-written `[providers.aws-<region>]` blocks; these
+# `docker run` args go via start_arg (vps_docker forwards start_arg to the inner
+# `docker run`): `--workdir=/` (runsc aborts when the image WORKDIR /home/user/workspace,
+# inside the mounted /home/user volume, already exists as the process cwd) and
+# `--security-opt=no-new-privileges`. `--restart=unless-stopped` brings the
+# agent container back after an EC2 reboot; the entrypoint then self-heals sshd.
+start_arg__extend = ["--security-opt=no-new-privileges", "--workdir=/", "--restart=unless-stopped"]
+# Same first-boot seed as the docker template; see comment there.
+post_host_create_command__extend = ["/usr/local/bin/default-workspace-template-seed"]
+# Install the outer-VM boot unit so the agent recovers after an EC2 reboot even
+# without the desktop app; same as the pool_host template..
+post_host_create_outer_command__extend = [
+    """
+set -eu
+cat > /usr/local/sbin/minds-outer-autostart.sh <<'BOOT'
+#!/bin/sh
+# Start every mngr-managed agent container and relaunch the system-services
+# agent inside it (in its full host+agent env, via the shared in-container
+# start script). Containers are found by the fixed mngr label, so this
+# survives container rebuilds. Triggered by minds-autostart.path once the
+# /mngr-btrfs data volume is ready (mngr-internal#266); the wait below makes
+# a premature trigger park until the mount actually exists instead of
+# failing repeatedly (root-fs debris shadowed under the unmounted mountpoint
+# once satisfied the old glob trigger early -- see the field report on
+# default-workspace-template#381). Any step that still fails makes the unit
+# fail, so breakage is visible in systemd instead of being swallowed.
+# `mngr start` is idempotent + flock-serialized, so racing the desktop
+# client is safe.
+set -u
+
+# Wait for the data volume to actually be mounted: generous hard bound, plus
+# a warning when it took suspiciously long. The trigger normally fires only
+# after the mount, so any wait at all here is unusual; on slices lima can
+# take many minutes to mount the disk on boot. Type=oneshot has no start
+# timeout, so systemd will not kill this wait.
+WAITED=0
+until mountpoint -q "$(readlink -f /mngr-btrfs)"; do
+    if [ "$WAITED" -ge 1800 ]; then
+        echo "timed out after ${WAITED}s waiting for /mngr-btrfs to be mounted" >&2
+        exit 1
+    fi
+    sleep 5
+    WAITED=$((WAITED + 5))
+done
+if [ "$WAITED" -gt 60 ]; then
+    echo "warning: waited ${WAITED}s for /mngr-btrfs to be mounted" >&2
+fi
+
+FAILED=0
+for cid in $(docker ps -aq --filter "label=com.imbue.mngr.host-id"); do
+    docker start "$cid" >/dev/null
+    if [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" != "true" ]; then
+        echo "agent container $cid did not reach running" >&2
+        FAILED=1
+        continue
+    fi
+    # Run the in-container start script from whichever location this
+    # container's generation carries. A container older than the script
+    # itself has none: for those, make sure sshd is up (its entrypoint is a
+    # bare keep-alive) and succeed with a journal notice -- a permanently
+    # missing script must not fail the unit, because the path unit
+    # retriggers a failing oneshot with no rate limit (the unit sets
+    # StartLimitIntervalSec=0 for transient failures), which would hot-loop
+    # forever on a condition that can never clear.
+    # CLEANUP: drop the /mngr/code candidate and the sshd fallback once no
+    # leased workspace container predates minds-v0.3.2 (the first version
+    # that ships minds_start_services_agent.sh).
+    if ! docker exec --workdir / "$cid" bash -lc 'for s in /home/user/workspace/system/scripts/minds_start_services_agent.sh /mngr/code/scripts/minds_start_services_agent.sh; do if test -x "$s"; then exec "$s"; fi; done; mkdir -p /run/sshd; grep -lxs sshd /proc/[0-9]*/comm >/dev/null 2>&1 || /usr/sbin/sshd -o MaxSessions=100 -o MaxStartups=100:30:200 || echo "warning: could not start sshd in this container" >&2; echo "no minds_start_services_agent.sh in this container generation; started container and sshd only" >&2'; then
+        echo "relaunching the services agent in container $cid failed" >&2
+        FAILED=1
+    fi
+done
+exit "$FAILED"
+BOOT
+chmod +x /usr/local/sbin/minds-outer-autostart.sh
+cat > /etc/systemd/system/minds-autostart.service <<'UNIT'
+[Unit]
+Description=Start the minds system-services agent once the data volume is up
+After=docker.service
+Requires=docker.service
+# Never rate-limit starts: while the trigger condition holds, a failing
+# service re-triggers immediately, and hitting the default start limit
+# propagates unit-start-limit-hit to minds-autostart.path -- permanently
+# disabling the watcher (observed on a staging box reboot; see the field
+# report on default-workspace-template#381).
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/minds-outer-autostart.sh
+UNIT
+cat > /etc/systemd/system/minds-autostart.path <<'UNIT'
+[Unit]
+Description=Watch for the mngr data volume and start the minds workspace
+
+[Path]
+# The marker file is created exclusively by this installer, behind a hard
+# mountpoint check, so it can only ever exist on the mounted data volume.
+# The bare /mngr-btrfs symlink persists (dangling) across reboots, and even
+# entries under it cannot be trusted: root-fs debris shadowed beneath the
+# unmounted mountpoint (a stale snapshot-helper request once mkdir'd
+# /mngr-btrfs/snapshots pre-mount) defeated the previous
+# PathExistsGlob=/mngr-btrfs/* condition and fired the service before the
+# volume existed. The wake-up event is the symlink recreation the provision
+# script performs right after mounting on each boot.
+PathExists=/mngr-btrfs/.minds-volume-ready
+Unit=minds-autostart.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+# The readiness marker the path unit watches may only ever be created here,
+# behind a hard mount check, so it can never appear on the unmounted root fs
+# (the way shadow debris under the mountpoint defeated the old glob trigger).
+if ! mountpoint -q "$(readlink -f /mngr-btrfs)"; then
+    echo "refusing to install minds-autostart: /mngr-btrfs is not a mounted volume" >&2
+    exit 1
+fi
+touch /mngr-btrfs/.minds-volume-ready
+# The service is only ever triggered by the path unit, so it cannot run before
+# the data volume exists. Remove any direct boot enablement left by the
+# previous installer (a no-op on fresh VMs), revive units a past boot may have
+# left dead of a start-rate limit (re-running this installer is the fleet
+# backfill path), then enable + start the watcher. Starting the path unit
+# alone does NOT fire the service when it is already active -- the previous
+# installer's boot-time oneshot swallowed its own failures and exited 0, and
+# RemainAfterExit=yes then latches the unit active, which is exactly the
+# state of a VM recovered from a wedge -- so explicitly restart the service
+# to run the start NOW. --no-block keeps this installer fast (the service
+# body may legitimately wait minutes for the data-volume mount), and the run
+# is safe on a healthy workspace (`docker start` and `mngr start` are
+# no-ops).
+rm -f /etc/systemd/system/multi-user.target.wants/minds-autostart.service
+systemctl daemon-reload
+systemctl reset-failed minds-autostart.path minds-autostart.service 2>/dev/null || true
+systemctl enable minds-autostart.path
+systemctl start minds-autostart.path
+systemctl restart --no-block minds-autostart.service
+""",
+]
+
+# template for GCP Compute Engine VPS provider (gcp mode). Mirrors the aws
+# template above: minds addresses the create as
+# `system-services@<host>.byo-gcp-<slug>` (a bring-your-own account block minds
+# writes on account setup), so no `provider` is declared here. Zone / machine
+# type come from that provider block (`default_zone` / `default_machine_type`)
+# plus the matching `-b --gcp-zone=` / `-b --gcp-machine-type=` minds passes.
+[create_templates.gcp]
+target_path = "/home/user/workspace/"
+build_arg__extend = ["--file=system/Dockerfile", "."]
+# Disable idle detection entirely -- the host should never auto-shutdown; the
+# machine is up for the whole user session (see the aws template's comment).
+idle_mode = "disabled"
+# Same container-hardening `docker run` args as the aws template. They are
+# runtime-agnostic (harmless under plain runc; required under gVisor's runsc if
+# the provider block opts into it): see the aws template for the rationale.
+start_arg__extend = ["--security-opt=no-new-privileges", "--workdir=/", "--restart=unless-stopped"]
+# Same forwarding as the docker template; see comment there.
+pass_host_env__extend = ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "GH_TOKEN"]
+# Same first-boot seed as the docker template; see comment there.
+post_host_create_command__extend = ["/usr/local/bin/default-workspace-template-seed"]
+# Install the outer-VM boot unit so the agent recovers after a VM reboot even
+# without the desktop app; identical to the aws template's unit.
+post_host_create_outer_command__extend = [
+    """
+set -eu
+cat > /usr/local/sbin/minds-outer-autostart.sh <<'BOOT'
+#!/bin/sh
+# Start every mngr-managed agent container and relaunch the system-services
+# agent inside it (in its full host+agent env, via the shared in-container
+# start script). Containers are found by the fixed mngr label, so this
+# survives container rebuilds. Triggered by minds-autostart.path once the
+# /mngr-btrfs data volume is ready (mngr-internal#266); the wait below makes
+# a premature trigger park until the mount actually exists instead of
+# failing repeatedly (root-fs debris shadowed under the unmounted mountpoint
+# once satisfied the old glob trigger early -- see the field report on
+# default-workspace-template#381). Any step that still fails makes the unit
+# fail, so breakage is visible in systemd instead of being swallowed.
+# `mngr start` is idempotent + flock-serialized, so racing the desktop
+# client is safe.
+set -u
+
+# Wait for the data volume to actually be mounted: generous hard bound, plus
+# a warning when it took suspiciously long. The trigger normally fires only
+# after the mount, so any wait at all here is unusual; on slices lima can
+# take many minutes to mount the disk on boot. Type=oneshot has no start
+# timeout, so systemd will not kill this wait.
+WAITED=0
+until mountpoint -q "$(readlink -f /mngr-btrfs)"; do
+    if [ "$WAITED" -ge 1800 ]; then
+        echo "timed out after ${WAITED}s waiting for /mngr-btrfs to be mounted" >&2
+        exit 1
+    fi
+    sleep 5
+    WAITED=$((WAITED + 5))
+done
+if [ "$WAITED" -gt 60 ]; then
+    echo "warning: waited ${WAITED}s for /mngr-btrfs to be mounted" >&2
+fi
+
+FAILED=0
+for cid in $(docker ps -aq --filter "label=com.imbue.mngr.host-id"); do
+    docker start "$cid" >/dev/null
+    if [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" != "true" ]; then
+        echo "agent container $cid did not reach running" >&2
+        FAILED=1
+        continue
+    fi
+    # Run the in-container start script from whichever location this
+    # container's generation carries. A container older than the script
+    # itself has none: for those, make sure sshd is up (its entrypoint is a
+    # bare keep-alive) and succeed with a journal notice -- a permanently
+    # missing script must not fail the unit, because the path unit
+    # retriggers a failing oneshot with no rate limit (the unit sets
+    # StartLimitIntervalSec=0 for transient failures), which would hot-loop
+    # forever on a condition that can never clear.
+    # CLEANUP: drop the /mngr/code candidate and the sshd fallback once no
+    # leased workspace container predates minds-v0.3.2 (the first version
+    # that ships minds_start_services_agent.sh).
+    if ! docker exec --workdir / "$cid" bash -lc 'for s in /home/user/workspace/system/scripts/minds_start_services_agent.sh /mngr/code/scripts/minds_start_services_agent.sh; do if test -x "$s"; then exec "$s"; fi; done; mkdir -p /run/sshd; grep -lxs sshd /proc/[0-9]*/comm >/dev/null 2>&1 || /usr/sbin/sshd -o MaxSessions=100 -o MaxStartups=100:30:200 || echo "warning: could not start sshd in this container" >&2; echo "no minds_start_services_agent.sh in this container generation; started container and sshd only" >&2'; then
+        echo "relaunching the services agent in container $cid failed" >&2
+        FAILED=1
+    fi
+done
+exit "$FAILED"
+BOOT
+chmod +x /usr/local/sbin/minds-outer-autostart.sh
+cat > /etc/systemd/system/minds-autostart.service <<'UNIT'
+[Unit]
+Description=Start the minds system-services agent once the data volume is up
+After=docker.service
+Requires=docker.service
+# Never rate-limit starts: while the trigger condition holds, a failing
+# service re-triggers immediately, and hitting the default start limit
+# propagates unit-start-limit-hit to minds-autostart.path -- permanently
+# disabling the watcher (observed on a staging box reboot; see the field
+# report on default-workspace-template#381).
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/minds-outer-autostart.sh
+UNIT
+cat > /etc/systemd/system/minds-autostart.path <<'UNIT'
+[Unit]
+Description=Watch for the mngr data volume and start the minds workspace
+
+[Path]
+# The marker file is created exclusively by this installer, behind a hard
+# mountpoint check, so it can only ever exist on the mounted data volume.
+# The bare /mngr-btrfs symlink persists (dangling) across reboots, and even
+# entries under it cannot be trusted: root-fs debris shadowed beneath the
+# unmounted mountpoint (a stale snapshot-helper request once mkdir'd
+# /mngr-btrfs/snapshots pre-mount) defeated the previous
+# PathExistsGlob=/mngr-btrfs/* condition and fired the service before the
+# volume existed. The wake-up event is the symlink recreation the provision
+# script performs right after mounting on each boot.
+PathExists=/mngr-btrfs/.minds-volume-ready
+Unit=minds-autostart.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+# The readiness marker the path unit watches may only ever be created here,
+# behind a hard mount check, so it can never appear on the unmounted root fs
+# (the way shadow debris under the mountpoint defeated the old glob trigger).
+if ! mountpoint -q "$(readlink -f /mngr-btrfs)"; then
+    echo "refusing to install minds-autostart: /mngr-btrfs is not a mounted volume" >&2
+    exit 1
+fi
+touch /mngr-btrfs/.minds-volume-ready
+# The service is only ever triggered by the path unit, so it cannot run before
+# the data volume exists. Remove any direct boot enablement left by the
+# previous installer (a no-op on fresh VMs), revive units a past boot may have
+# left dead of a start-rate limit (re-running this installer is the fleet
+# backfill path), then enable + start the watcher. Starting the path unit
+# alone does NOT fire the service when it is already active -- the previous
+# installer's boot-time oneshot swallowed its own failures and exited 0, and
+# RemainAfterExit=yes then latches the unit active, which is exactly the
+# state of a VM recovered from a wedge -- so explicitly restart the service
+# to run the start NOW. --no-block keeps this installer fast (the service
+# body may legitimately wait minutes for the data-volume mount), and the run
+# is safe on a healthy workspace (`docker start` and `mngr start` are
+# no-ops).
+rm -f /etc/systemd/system/multi-user.target.wants/minds-autostart.service
+systemctl daemon-reload
+systemctl reset-failed minds-autostart.path minds-autostart.service 2>/dev/null || true
+systemctl enable minds-autostart.path
+systemctl start minds-autostart.path
+systemctl restart --no-block minds-autostart.service
+""",
+]
+
+# template for Azure Virtual Machines VPS provider (azure mode). Mirrors the
+# aws template above: minds addresses the create as
+# `system-services@<host>.byo-azure-<slug>` (a bring-your-own account block
+# minds writes on account setup), so no `provider` is declared here. Region /
+# VM size come from that provider block (`default_region` / `default_vm_size`)
+# plus the matching `-b --azure-region=` / `-b --azure-vm-size=` minds passes.
+[create_templates.azure]
+target_path = "/home/user/workspace/"
+build_arg__extend = ["--file=system/Dockerfile", "."]
+# Disable idle detection entirely -- the host should never auto-shutdown; the
+# machine is up for the whole user session (see the aws template's comment).
+idle_mode = "disabled"
+# Same container-hardening `docker run` args as the aws template. They are
+# runtime-agnostic (harmless under plain runc; required under gVisor's runsc if
+# the provider block opts into it): see the aws template for the rationale.
+start_arg__extend = ["--security-opt=no-new-privileges", "--workdir=/", "--restart=unless-stopped"]
+# Same forwarding as the docker template; see comment there.
+pass_host_env__extend = ["ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "GH_TOKEN"]
+# Same first-boot seed as the docker template; see comment there.
+post_host_create_command__extend = ["/usr/local/bin/default-workspace-template-seed"]
+# Install the outer-VM boot unit so the agent recovers after a VM reboot even
+# without the desktop app; identical to the aws template's unit.
+post_host_create_outer_command__extend = [
+    """
+set -eu
+cat > /usr/local/sbin/minds-outer-autostart.sh <<'BOOT'
+#!/bin/sh
+# Start every mngr-managed agent container and relaunch the system-services
+# agent inside it (in its full host+agent env, via the shared in-container
+# start script). Containers are found by the fixed mngr label, so this
+# survives container rebuilds. Triggered by minds-autostart.path once the
+# /mngr-btrfs data volume is ready (mngr-internal#266); the wait below makes
+# a premature trigger park until the mount actually exists instead of
+# failing repeatedly (root-fs debris shadowed under the unmounted mountpoint
+# once satisfied the old glob trigger early -- see the field report on
+# default-workspace-template#381). Any step that still fails makes the unit
+# fail, so breakage is visible in systemd instead of being swallowed.
+# `mngr start` is idempotent + flock-serialized, so racing the desktop
+# client is safe.
+set -u
+
+# Wait for the data volume to actually be mounted: generous hard bound, plus
+# a warning when it took suspiciously long. The trigger normally fires only
+# after the mount, so any wait at all here is unusual; on slices lima can
+# take many minutes to mount the disk on boot. Type=oneshot has no start
+# timeout, so systemd will not kill this wait.
+WAITED=0
+until mountpoint -q "$(readlink -f /mngr-btrfs)"; do
+    if [ "$WAITED" -ge 1800 ]; then
+        echo "timed out after ${WAITED}s waiting for /mngr-btrfs to be mounted" >&2
+        exit 1
+    fi
+    sleep 5
+    WAITED=$((WAITED + 5))
+done
+if [ "$WAITED" -gt 60 ]; then
+    echo "warning: waited ${WAITED}s for /mngr-btrfs to be mounted" >&2
+fi
+
+FAILED=0
+for cid in $(docker ps -aq --filter "label=com.imbue.mngr.host-id"); do
+    docker start "$cid" >/dev/null
+    if [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" != "true" ]; then
+        echo "agent container $cid did not reach running" >&2
+        FAILED=1
+        continue
+    fi
+    # Run the in-container start script from whichever location this
+    # container's generation carries. A container older than the script
+    # itself has none: for those, make sure sshd is up (its entrypoint is a
+    # bare keep-alive) and succeed with a journal notice -- a permanently
+    # missing script must not fail the unit, because the path unit
+    # retriggers a failing oneshot with no rate limit (the unit sets
+    # StartLimitIntervalSec=0 for transient failures), which would hot-loop
+    # forever on a condition that can never clear.
+    # CLEANUP: drop the /mngr/code candidate and the sshd fallback once no
+    # leased workspace container predates minds-v0.3.2 (the first version
+    # that ships minds_start_services_agent.sh).
+    if ! docker exec --workdir / "$cid" bash -lc 'for s in /home/user/workspace/system/scripts/minds_start_services_agent.sh /mngr/code/scripts/minds_start_services_agent.sh; do if test -x "$s"; then exec "$s"; fi; done; mkdir -p /run/sshd; grep -lxs sshd /proc/[0-9]*/comm >/dev/null 2>&1 || /usr/sbin/sshd -o MaxSessions=100 -o MaxStartups=100:30:200 || echo "warning: could not start sshd in this container" >&2; echo "no minds_start_services_agent.sh in this container generation; started container and sshd only" >&2'; then
+        echo "relaunching the services agent in container $cid failed" >&2
+        FAILED=1
+    fi
+done
+exit "$FAILED"
+BOOT
+chmod +x /usr/local/sbin/minds-outer-autostart.sh
+cat > /etc/systemd/system/minds-autostart.service <<'UNIT'
+[Unit]
+Description=Start the minds system-services agent once the data volume is up
+After=docker.service
+Requires=docker.service
+# Never rate-limit starts: while the trigger condition holds, a failing
+# service re-triggers immediately, and hitting the default start limit
+# propagates unit-start-limit-hit to minds-autostart.path -- permanently
+# disabling the watcher (observed on a staging box reboot; see the field
+# report on default-workspace-template#381).
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/minds-outer-autostart.sh
+UNIT
+cat > /etc/systemd/system/minds-autostart.path <<'UNIT'
+[Unit]
+Description=Watch for the mngr data volume and start the minds workspace
+
+[Path]
+# The marker file is created exclusively by this installer, behind a hard
+# mountpoint check, so it can only ever exist on the mounted data volume.
+# The bare /mngr-btrfs symlink persists (dangling) across reboots, and even
+# entries under it cannot be trusted: root-fs debris shadowed beneath the
+# unmounted mountpoint (a stale snapshot-helper request once mkdir'd
+# /mngr-btrfs/snapshots pre-mount) defeated the previous
+# PathExistsGlob=/mngr-btrfs/* condition and fired the service before the
+# volume existed. The wake-up event is the symlink recreation the provision
+# script performs right after mounting on each boot.
+PathExists=/mngr-btrfs/.minds-volume-ready
+Unit=minds-autostart.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+# The readiness marker the path unit watches may only ever be created here,
+# behind a hard mount check, so it can never appear on the unmounted root fs
+# (the way shadow debris under the mountpoint defeated the old glob trigger).
+if ! mountpoint -q "$(readlink -f /mngr-btrfs)"; then
+    echo "refusing to install minds-autostart: /mngr-btrfs is not a mounted volume" >&2
+    exit 1
+fi
+touch /mngr-btrfs/.minds-volume-ready
+# The service is only ever triggered by the path unit, so it cannot run before
+# the data volume exists. Remove any direct boot enablement left by the
+# previous installer (a no-op on fresh VMs), revive units a past boot may have
+# left dead of a start-rate limit (re-running this installer is the fleet
+# backfill path), then enable + start the watcher. Starting the path unit
+# alone does NOT fire the service when it is already active -- the previous
+# installer's boot-time oneshot swallowed its own failures and exited 0, and
+# RemainAfterExit=yes then latches the unit active, which is exactly the
+# state of a VM recovered from a wedge -- so explicitly restart the service
+# to run the start NOW. --no-block keeps this installer fast (the service
+# body may legitimately wait minutes for the data-volume mount), and the run
+# is safe on a healthy workspace (`docker start` and `mngr start` are
+# no-ops).
+rm -f /etc/systemd/system/multi-user.target.wants/minds-autostart.service
+systemctl daemon-reload
+systemctl reset-failed minds-autostart.path minds-autostart.service 2>/dev/null || true
+systemctl enable minds-autostart.path
+systemctl start minds-autostart.path
+systemctl restart --no-block minds-autostart.service
+""",
+]
+
+# Template for imbue_cloud-leased pool hosts. minds invokes this as
+# `--template main --template imbue_cloud` (mirroring how the other modes
+# use `--template main --template <provider>`), so the imbue_cloud-specific
+# knobs that used to be inlined in `_build_mngr_create_command` live here
+# instead. The actual provider name on the address is per-account
+# (`imbue_cloud_<account-slug>`), so it's not declared here -- the
+# `<name>@<host>.imbue_cloud_<slug>` address tells mngr where to land.
+[create_templates.imbue_cloud]
+# Leased pool hosts must never auto-shutdown -- the host is borrowed for a
+# whole user session, not a one-shot job.
+idle_mode = "disabled"
+# The agent workspace lives on the persistent volume at /home/user/workspace/. The fast
+# (adopt) path ignores this -- it reuses the pre-baked agent's recorded
+# work_dir -- but the slow (rebuild) path rebuilds the container from scratch
+# and needs the standard target_path so the DEFAULT_WORKSPACE_TEMPLATE workspace lands in the right
+# place, exactly like the vultr/ovh templates.
+target_path = "/home/user/workspace/"
+# Docker build args forwarded verbatim to the delegated vps_docker build that
+# the imbue_cloud SLOW path runs (it tears down the leased pool host's baked
+# container and rebuilds it from this Dockerfile). The FAST path adopts the
+# pre-baked image and ignores these (the imbue_cloud provider treats them as
+# pass-through and only the slow path consumes them). Mirrors the ovh template.
+build_arg__extend = ["--file=system/Dockerfile", "."]
+# `--restart=unless-stopped` on the inner agent container so a slow-path rebuild
+# (which recreates the container) comes back after a pool-VM reboot, matching the
+# baked container from the pool_host template. The fast (adopt) path reuses the
+# pre-baked container, which already carries this policy.
+start_arg__extend = ["--restart=unless-stopped"]
+# Forward the minds-side MNGR_PREFIX from minds' subprocess env onto the
+# host's ``/home/user/.mngr/env``, so the in-container mngr sees the same prefix the
+# desktop client used. Anthropic credentials are deliberately NOT forwarded
+# anywhere: workspace Claude auth lives in the env block of the shared
+# ~/.claude/settings.json, written by the in-UI sign-in modal.
+pass_host_env__extend = ["MNGR_PREFIX"]
+# Seed /home/user/workspace from the baked image on first boot (idempotent warm-boot
+# fast path). Runs after create_host for both paths; on the fast path the
+# code is already present so default-workspace-template-seed is a no-op. Same as the vultr/ovh
+# templates.
+post_host_create_command__extend = ["/usr/local/bin/default-workspace-template-seed"]
+## and these templates are for sub-agents created within the sandbox.
+##
+## The harness (which agent binary runs) is chosen at create time with
+## `--type <harness>`, which resolves the matching `[agent_types.<harness>]` block
+## directly -- there is no per-harness create template. A ROLE template says what the
+## agent is *for* (where it works, what it is told, what its environment holds) and
+## never sets `type`, so the same role runs under any harness:
+##
+##   mngr create <name> --type <harness> -t <role>
+##
+## Keeping the harness on `--type` and the purpose in a role template is what stops
+## the template list from growing as the product of harnesses and roles: adding a
+## harness costs one `[agent_types.<harness>]` block, not one template per role.
+##
+## Aggregate keys in a role use `__extend`, never a bare assign: templates stack,
+## and a bare assign over a key an earlier template in the stack contributed to is
+## rejected by the settings narrowing guard.
+
+## --- roles ---
+
+# Chat: a user-facing conversational agent, sharing the workspace's work
+# directory (`transfer = none`) rather than taking a worktree of its own -- one
+# workspace, one work_dir, all chats in it.
+#
+# The output style is what makes chat agents talk like a subordinate while
+# workers and automations stay unstyled. `output_style` names the `name:`
+# frontmatter of a file in .agents/output-styles/ (mngr validates it at create
+# and fails loudly on a miss). It is harness-neutral: claude takes it as its
+# native `outputStyle` setting, codex -- which has no output-style concept --
+# gets the same file's body as developer instructions.
+#
+# `MNGR_AGENT_ROLE=chat` marks the agent as a chat (as opposed to a worker or
+# a bare `mngr create` agent) for any tooling that wants to tell them apart;
+# AGENTS.md's finish-notification rule is addressed to chats and is prose-only.
+[create_templates.chat]
+transfer = "none"
+output_style = "Engineering Subordinate"
+env__extend = ["MNGR_AGENT_ROLE=chat"]
+
+# Fast: launches the fast-capable harnesses in fast mode so a new conversation
+# feels responsive. The chat app stacks it on a chat whose fast mode is on, or
+# auto with its fast turns still to run (a new chat's mode is the workspace's
+# default, `fast_mode_default` in the chat app's `data/.apps/chat/settings.json`).
+#
+# The two fast settings are deliberately asymmetric: claude's
+# `settings_overrides` is a SettingsPatchField (deep-merge marker on the
+# field), so a bare dotted path merges into the [agent_types.claude] block.
+# codex's `config_overrides` is a PLAIN dict -- a bare dotted assignment trips
+# the settings-narrowing guard (it would drop the features/tools blocks), so
+# the codex entry needs __extend markers at BOTH dict levels. Do not "fix" the
+# inconsistency in either direction. Settings for whichever harness is not
+# resolved are inert, so this template is safe to stack with any --type.
+[create_templates.fast]
+setting__extend = [
+    "agent_types.claude.settings_overrides.fastMode=true",
+    'agent_types.codex.config_overrides__extend={"service_tier":"fast","features__extend":{"fast_mode":true}}',
+]
+
+# Caretaker: the weekly maintenance agent -- the tailored instance of the
+# generic `automation` role below. Spawned (and re-woken) by the caretaker job
+# (the /etc/cron.d/minds-caretaker entry the enable-caretaker skill creates --
+# absent until then, weekly and findings-gated via
+# system/services/caretaker/caretaker_check.sh once enabled) via
+# system/libs/automations/run_automation.sh, and labelled automation=caretaker
+# so it can be found as a singleton (the agent surfaces its own chat window via
+# system/scripts/layout.py after its first message).
+[create_templates.caretaker]
+transfer = "none"
+env__extend = ["MNGR_AGENT_ROLE=caretaker"]
+append_system_prompt__extend = ["You are the Caretaker: a maintenance agent for this workspace, woken about once a week when a scheduled check finds something worth reporting. When you are messaged to run, follow the `caretaker` skill (.agents/skills/caretaker/SKILL.md) exactly. Always speak to the user in plain, non-technical, user-experience terms. Apart from one look-only scan on your very first run -- which you always do to introduce yourself, and which never changes anything -- never scan logs or apply fixes without the permission recorded in data/.state/caretaker/permissions.md, and never apply a fix on that first run."]
+
+# Automation: the reusable base for any skill run on a cadence (the Caretaker
+# above is a tailored instance). system/libs/automations/run_automation.sh
+# <skill> spawns one per skill, labels it automation=<skill>, and messages it
+# `/<skill>` on every run -- so a new automation (e.g. a morning news digest)
+# needs only a skill plus a cron entry, no new template.
+[create_templates.automation]
+transfer = "none"
+env__extend = ["MNGR_AGENT_ROLE=automation"]
+append_system_prompt__extend = ["You are an automation agent for this workspace. You are woken on a schedule and sent a slash-command naming the skill to run; follow that skill's instructions in .agents/skills/<name>/SKILL.md exactly. Right after sending your first chat message of each run (never before it, so the window does not pop up empty), silently surface your own chat window by running: python3 system/scripts/layout.py open chat --path \"/?chat=${MINDS_CHAT_ID:-$MNGR_AGENT_ID}\" (with no --desktop it lands on the desktop the user is looking at; best-effort -- continue if it fails). Speak to the user in plain, non-technical, user-experience terms, and do your work via tool calls rather than narrating it."]
+
+# Worker: general purpose sub-agent for doing tasks reliably (and ensuring they
+# are verified), landing in its own git worktree so its work is isolated from
+# the workspace checkout until merged back.
+#
+# The stop hook stays enabled (REVIEWER_STOP_HOOK_ENABLE=1) for a single
+# purpose: its uncommitted-changes gate, which keeps a worker from ending a
+# turn with uncommitted work (that work is silently lost when the branch is
+# merged back). The review gates are turned OFF -- REVIEWER_AUTOFIX_ENABLE=0
+# and REVIEWER_VERIFY_ARCHITECTURE_ENABLE=0 -- because the worker skills already
+# prompt for /autofix and the architecture gate at the single right moment (the
+# hardening pass), and having the hook re-demand them on every commit fought
+# that. Clearing the flags only stops the hook from gating on them; the worker
+# still runs both commands by hand (the autofix / verify-architecture skills
+# don't read these flags -- only the stop hook's gate checker does).
+# REVIEWER_CI_ENABLE=0: repos created from this template are isolated units --
+# the stop hook must never auto-create PRs or push to origin (the repo-level
+# .reviewer/settings.json likewise disables ci + stop_hook.fetch_and_merge).
+#
+# Nothing worker-specific is installed into the worker's skill tree: the harden
+# worker is followed in place, from the checkout every worker already has at
+# .agents/shared/worker/SKILL.md, because a lead's task file names that path
+# outright. (The venv converge that used to sit here now runs for every agent
+# from [commands.create], and lands before this.)
+#
+# claude_update_plugin.sh installs the code-guardian plugin (and the other
+# .claude/settings.json plugins) for the worker's worktree path BEFORE its
+# claude starts. Claude Code resolves the plugin set at session startup, so the
+# SessionStart-hook install that chat agents rely on lands too late for a
+# worker's single session -- it would start with no /autofix or
+# /verify-architecture at all, and the harden contract mandates both. It runs
+# WITHOUT --strict on purpose: a plugin or marketplace outage must never make a
+# worker undeployable, so an install failure is a warning in the provision
+# output (and the worker reports the missing gate) rather than a failed launch.
+[create_templates.worker]
+transfer = "git-worktree"
+extra_window__extend = ["reviewer_settings='system/scripts/create_reviewer_settings.sh $REVIEWER_AUTOFIX_ENABLE $REVIEWER_CI_ENABLE $REVIEWER_VERIFY_CONVERSATION_ENABLE $REVIEWER_AUTOFIX_MINOR $REVIEWER_VERIFY_ARCHITECTURE_ENABLE $REVIEWER_STOP_HOOK_ENABLE'"]
+env__extend = ["REVIEWER_AUTOFIX_ENABLE=0", "REVIEWER_CI_ENABLE=0", "REVIEWER_VERIFY_CONVERSATION_ENABLE=0", "REVIEWER_AUTOFIX_MINOR=0", "REVIEWER_VERIFY_ARCHITECTURE_ENABLE=0", "REVIEWER_STOP_HOOK_ENABLE=1", "MNGR_AGENT_ROLE=worker"]
+# Converge the venv for worker agents, ahead of the plugin install so deps are ready
+# first. A fresh git worktree (transfer = "git-worktree" above) carries no .venv
+# (gitignored), so a worker's first `uv run` would otherwise cold-build one mid-task --
+# lazily, with root-closure scope rather than --all-packages, racing whatever the agent
+# is doing (intermittent ModuleNotFoundError, e.g. imbue_common). Scoped to the worker
+# role: a `-t worker` create resolves to type `claude` and applies THIS template, so the
+# sync belongs here, not on the `[agent_types.worker]` legacy shim (which only re-resolves
+# agents whose persisted type is already worker). Chat/main agents share the services
+# agent's boot-time converge. uv's warm cache makes this hardlink-fast when up to date.
+extra_provision_command__extend = ["uv sync --all-packages", "bash system/scripts/claude_update_plugin.sh"]
+append_system_prompt__extend = ["You were launched by another agent. List any questions at the end of your final response, along with the assumptions you made."]
+
+# Shims for agents created before roles moved to create templates: their persisted
+# `type` is re-resolved from this file on every load, so dropping these sections
+# would fall them back to BaseAgent on upgrade. Delete once no live workspace has them.
+[agent_types.chat]
+parent_type = "claude"
+
+[agent_types.worker]
+parent_type = "claude"
