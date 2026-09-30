@@ -1,0 +1,24 @@
+name = "task-status"
+display_name = "Example shared app: a status card (swap in your own)"
+icon = "icon.svg"
+priority = "user"
+program = "task-status"
+
+# How update-app boots a throwaway preview of this app: on a free port, over a
+# scratch copy of its data (see .agents/skills/update-app/scripts/preview_app.py).
+[preview]
+env = {TASK_STATUS_PORT = "{port:main}", TASK_STATUS_HOST = "{host}", TASK_STATUS_DATA_DIR = "{copy:data}"}
+copies = {data = "data/.apps/task-status"}
+
+[[references]]
+path = "system/supervisord.conf.d/task-status-gate.conf"
+note = "Sidecar program: the signature gate that lets allowed viewers reach this app's pages and live-update stream over the tunnel"
+
+[[references]]
+path = "system/supervisord.conf.d/task-status-tunnel.conf"
+note = "Sidecar program: the ngrok tunnel publishing the gate at a fixed public address"
+
+[[secrets]]
+file = "status-tunnel"
+variables = ["NGROK_AUTHTOKEN"]
+note = "an ngrok auth token, for the tunnel that publishes the gate at a fixed public address"

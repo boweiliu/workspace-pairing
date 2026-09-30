@@ -1,0 +1,90 @@
+# Machine-readable manifest for this template. The sibling
+# template.md holds the prose, the Requirements list, and the two
+# append-only history logs; this file is authoritative for everything
+# below. Both are generated together -- validate_template.py fails if
+# they disagree.
+format = "v2"
+
+[template]
+slug = "workspace-pairing"
+title = "Workspace pairing: share a live app between two Minds"
+description = "Pair two Mind workspaces with a single-use, expiring invite so one can view something the other is sharing live, with no account sign-in. Demonstrated with a simple example status card app."
+thumbnail = "template.svg"
+version = "v1"
+
+# How this template is DERIVED from the workspace it came from. An
+# update re-runs this recipe rather than diffing two repos, which is what
+# keeps an exclusion excluded even though the thing still exists upstream.
+[recipe]
+include = ["system/apps/task_status", "system/supervisord.conf.d/task-status.conf", "system/supervisord.conf.d/task-status-gate.conf", "system/supervisord.conf.d/task-status-tunnel.conf"]
+data_include = []
+# One entry per deliberate exclusion (paths left out, and features stripped
+# from an included path).
+exclude = [
+    "data/.apps/task-status/ -- the publisher's own card content, paired viewers, and outstanding invites; an adopter starts with none",
+    "data/workspace-pairing/ -- the publisher's private design notes and decision log for the pairing protocol; the code's pointers to them are rewritten to stand alone (see modification_rules)",
+]
+# One entry per published-version modification, stated as a RULE and NEVER
+# the removed value -- the point of a modification is that the value does
+# not ship.
+modification_rules = [
+    "replace the publisher's real ngrok tunnel domain with an obvious placeholder domain, both in the tunnel program's environment and in the invite script's fallback default and its docstring examples",
+    "add a comment above the tunnel program's environment line telling the adopter to set their own ngrok domain after creating their own tunnel credential",
+    "replace the real person's name used as the example peer principal, and as the named peer in README prose, with a generic peer name and generic phrasing",
+    "replace the publisher's own name in code comments with 'the owner'",
+    "replace pointers to the publisher's private design notes (which do not ship) with the reasoning stated inline, or drop them",
+    "rename the example app's display name to say it is an example to swap for your own",
+    "expand the example app's README to say it is the example payload shared through the pairing mechanism, and that an adopter would swap in their own app",
+    "reframe the pairing README's opening so the pairing mechanism (invite, gate, peer client) reads as the feature and the status card as its example payload, keeping all operational instructions unchanged",
+]
+
+# Everything an adopter must deal with before this is really theirs.
+# One list -- but each entry's KIND says how it is handled, because the
+# two are handled at different times by different mechanisms:
+#
+#   permission / secret / llm = ACTIVATION. The adopting agent acts on
+#   these FIRST and BY ITSELF, initiating each latchkey permission
+#   request and each secret request before asking the user anything.
+#   Every one of them must have a matching requires_ line in template.md
+#   and vice versa -- the validator checks that, because an adopter once
+#   never got prompted for a permission the app needed.
+#
+#   The [[requirements.secret]] entries below were AGGREGATED from the
+#   included apps' app.toml [[secrets]] and skills' SKILL.md secrets:
+#   declarations, plus every data/.secrets/<file>.env the snapshot's
+#   mcp-servers.json and supervisord programs run under. Fix a wrong one
+#   at its declaration, not here.
+#
+#   adaptation = worked through INTERACTIVELY with the user afterwards.
+#   Prose on both sides, so it is not cross-checked.
+#
+# No [[requirements.permission]]: nothing in the included code calls an
+# external API through latchkey (the tunnel README's optional key-rotation
+# recipe is a manual step that the ngrok dashboard also covers).
+# No [requirements.llm]: nothing in the included code calls a model.
+[requirements]
+
+[[requirements.secret]]
+file = "status-tunnel"
+variables = ["NGROK_AUTHTOKEN"]
+note = "an ngrok auth token, for the tunnel that publishes the gate at a fixed public address"
+
+[[requirements.adaptation]]
+summary = "the tunnel domain is a placeholder (your-tunnel-domain.ngrok-free.dev), set in the tunnel program's environment line in system/supervisord.conf.d/task-status-tunnel.conf and as the fallback default in system/apps/task_status/tunnel/create_invite.py"
+resolution = "have the user create their own ngrok account (the free plan gives one fixed address per account) and auth token, set their domain in both places, and restart task-status-tunnel"
+
+[[requirements.adaptation]]
+summary = "the example status card starts empty: data/.apps/task-status/status.json is not shipped, so it reads 'No task loaded'"
+resolution = "write a status.json (title, status, links as a label-to-URL map, agent_active), or point the gate's STATUS_GATE_UPSTREAM_PORT at an app of the user's own that they want to share instead"
+
+[[requirements.adaptation]]
+summary = "the viewing workspace needs the peer client, and no viewers are paired at first (allowed_signers and the invite list start empty)"
+resolution = "give the viewing workspace a copy of system/apps/task_status/tunnel/peer_client/ (or have it adopt this template too), then mint an invite with create_invite.py and have the viewer redeem it with pair.py"
+
+# What the included code needs INSTALLED beyond the stock template: nothing.
+# ssh-keygen, curl, and tar ship in the stock image, and the ngrok agent is
+# downloaded at runtime into data/.state/status_tunnel/bin/ by run_tunnel.sh
+# rather than installed as a dependency.
+[environment]
+apt = []
+env_d_units = []

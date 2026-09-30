@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 160" role="img" aria-label="Two workspace windows paired by a key, the left one sharing a live status card that appears in the right one">
+  <rect width="240" height="160" rx="12" fill="#f3efe6"/>
+
+  <!-- sharing workspace -->
+  <rect x="14" y="30" width="86" height="96" rx="7" fill="#ffffff" stroke="#2f2d29" stroke-width="1.5"/>
+  <path d="M14 37a7 7 0 0 1 7-7h72a7 7 0 0 1 7 7v7H14z" fill="#e4ddcf" stroke="#2f2d29" stroke-width="1.5"/>
+  <circle cx="22" cy="37" r="1.8" fill="#2f2d29"/>
+  <circle cx="28" cy="37" r="1.8" fill="#2f2d29"/>
+  <circle cx="34" cy="37" r="1.8" fill="#2f2d29"/>
+  <rect x="22" y="52" width="70" height="64" rx="5" fill="#fbfaf7" stroke="#d6cebe"/>
+  <circle cx="31" cy="62" r="3.5" fill="#22c55e"/>
+  <rect x="38" y="59" width="44" height="6" rx="3" fill="#2f2d29"/>
+  <rect x="29" y="73" width="54" height="4" rx="2" fill="#a39d90"/>
+  <rect x="29" y="81" width="40" height="4" rx="2" fill="#a39d90"/>
+  <rect x="29" y="95" width="24" height="11" rx="5.5" fill="#dde8f7"/>
+  <rect x="57" y="95" width="24" height="11" rx="5.5" fill="#dde8f7"/>
+
+  <!-- viewing workspace, showing the same card live -->
+  <rect x="140" y="30" width="86" height="96" rx="7" fill="#ffffff" stroke="#2f2d29" stroke-width="1.5"/>
+  <path d="M140 37a7 7 0 0 1 7-7h72a7 7 0 0 1 7 7v7h-86z" fill="#e4ddcf" stroke="#2f2d29" stroke-width="1.5"/>
+  <circle cx="148" cy="37" r="1.8" fill="#2f2d29"/>
+  <circle cx="154" cy="37" r="1.8" fill="#2f2d29"/>
+  <circle cx="160" cy="37" r="1.8" fill="#2f2d29"/>
+  <rect x="148" y="52" width="70" height="64" rx="5" fill="#fbfaf7" stroke="#d6cebe"/>
+  <circle cx="157" cy="62" r="7" fill="none" stroke="#22c55e" stroke-width="1.2" opacity="0.4"/>
+  <circle cx="157" cy="62" r="3.5" fill="#22c55e"/>
+  <rect x="164" y="59" width="44" height="6" rx="3" fill="#2f2d29"/>
+  <rect x="155" y="73" width="54" height="4" rx="2" fill="#a39d90"/>
+  <rect x="155" y="81" width="40" height="4" rx="2" fill="#a39d90"/>
+  <rect x="155" y="95" width="24" height="11" rx="5.5" fill="#dde8f7"/>
+  <rect x="183" y="95" width="24" height="11" rx="5.5" fill="#dde8f7"/>
+
+  <!-- the pairing: a keyed, one-way link from sharer to viewer -->
+  <line x1="102" y1="78" x2="136" y2="78" stroke="#2f2d29" stroke-width="1.5" stroke-dasharray="3 3"/>
+  <path d="M131 74l5 4-5 4" fill="none" stroke="#2f2d29" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="119" cy="78" r="9.5" fill="#2f2d29"/>
+  <circle cx="115.5" cy="78" r="2.8" fill="none" stroke="#f3efe6" stroke-width="1.5"/>
+  <path d="M118.3 78h6.2m-2 0v2.6m-2-2.6v1.8" fill="none" stroke="#f3efe6" stroke-width="1.5" stroke-linecap="round"/>
+
+  <text x="57" y="143" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="9" fill="#6b665c">sharing</text>
+  <text x="183" y="143" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="9" fill="#6b665c">viewing</text>
+</svg>
